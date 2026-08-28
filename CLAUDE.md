@@ -57,7 +57,19 @@ time + an expandable live-audio-level debug drawer while recording.
   recording is `RecBarColor.green` (Apple's system green, #34C759 — 2026-08-28, explicit user
   request for a "shining green" recording indicator), paused is `RecBarColor.red`, and an
   in-flight watchdog prompt overrides both to orange (see `MenuBarIcon.tint` in
-  `RecBarApp.swift`; `RecBarColor` lives in `Theme.swift`).
+  `RecBarApp.swift`; `RecBarColor` lives in `Theme.swift`). **Green didn't actually render
+  (2026-08-28, real-usage report — stayed black/white)**: `NSStatusItem` buttons render
+  SwiftUI `Image`s as *template* images by default (monochrome, auto-inverting on
+  highlight/click), which silently drops any `.foregroundStyle` color unless told otherwise.
+  Fixed by adding `.renderingMode(.original)` to the menu bar `Image`, but only while a
+  non-default color is actually wanted (`MenuBarIcon.isColored`: recording, paused, or an
+  in-flight watchdog prompt) — idle deliberately stays `.template` so it still blends with the
+  system's monochrome menu bar icons and correctly inverts when the item is highlighted/
+  clicked, which a permanently-`.original` image would lose. Not yet visually verified (no GUI
+  automation for native macOS apps in this environment — see "Testing notes"); if the color
+  still doesn't show after this, the next suspect is a third-party menu-bar-icon manager (e.g.
+  Bartender/Ice/Hidden Bar) forcing all icons monochrome at a layer RecBar can't control from
+  its own code.
 
 ## obs-websocket requests actually used
 
@@ -400,6 +412,26 @@ recover from a partial setup), and does two things:
     (`sceneNameOverride`) instead of baked into `ReleasableInputConfig.sceneName` — correct
     because these are audio-only sources with no meaningful per-scene transform to preserve
     anyway, so there's no real reason to snapshot them per-scene in the first place.
+  - **`USB PnP` (the global Aux Audio Device 1 slot, not a scene item — see "OBS scenes &
+    sources" above) was never included in any of this, root cause confirmed (2026-08-28,
+    real-usage bug report: macOS's mic-in-use menu bar indicator stayed lit after stopping a
+    recording that had used the USB mic).** Since it's a global source rather than a scene
+    item, it can't go through `releaseInput`/`restoreInput`'s `CreateInput`-into-a-scene
+    machinery at all — and nothing else ever muted or released it at idle either, so once a
+    recording used the USB mic, its physical device stayed open indefinitely (same underlying
+    reason `Macbook`/`Headphones Mic` needed real `RemoveInput` treatment above: OBS's audio
+    plugins keep the CoreAudio device open for metering/mixing regardless of mute state, so
+    muting alone was never going to release it, even if `goIdleInOBS` had muted it). Fixed
+    with a narrower, USB-PnP-specific method, `AppState.releaseUSBMicIfLive()` (called from
+    `goIdleInOBS`, not part of the generic `ReleasableInputConfig` mechanism since there's no
+    scene item to snapshot): mutes it and clears its `device_id` to `""`. Clearing (rather
+    than removing the input outright, which isn't meaningful for a global Aux slot) is enough
+    here because `applyMicrophonePriority` already unconditionally rewrites a fresh
+    `device_id` immediately before every recording start when a USB mic is present (see
+    "Microphone priority rule" above) — so there's nothing to snapshot/restore the way there
+    is for the removed/recreated scene-item inputs. Not yet verified end-to-end with real
+    hardware (a real USB mic unplug/replug or a real stop-then-check-the-menu-bar-dot) — only
+    by reading the code and a clean `./build.sh` compile.
 - `RemoveInput` was originally believed to be merely **flaky/eventually-consistent** on this
   OBS build (a `GetInputList` sometimes still showed the "removed" input for several seconds
   before it actually disappeared, no clear trigger found). **Confirmed worse (2026-08-22,

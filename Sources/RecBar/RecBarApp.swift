@@ -37,8 +37,19 @@ private struct MenuBarIcon: View {
     @EnvironmentObject var appState: AppState
 
     var body: some View {
+        // NSStatusItem buttons render SwiftUI Images as template (monochrome, auto-inverting
+        // on highlight) by default, which silently drops any .foregroundStyle color — this is
+        // why plain foregroundStyle alone doesn't reliably show real color in the menu bar.
+        // .renderingMode(.original) opts out of that for the colored states specifically, so
+        // the actual tint shows through; idle stays template so it still blends with the
+        // system's black/white menu bar icons and inverts correctly when highlighted/clicked.
         Image(systemName: iconName)
+            .renderingMode(isColored ? .original : .template)
             .foregroundStyle(tint)
+    }
+
+    private var isColored: Bool {
+        appState.watchdogPromptDeadline != nil || appState.recordingState != .idle
     }
 
     private var iconName: String {

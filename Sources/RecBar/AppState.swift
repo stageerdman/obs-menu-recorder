@@ -299,6 +299,25 @@ final class AppState: ObservableObject {
         await releaseInput(at: \.desktopAudioRelease)
         await releaseInput(at: \.micBuiltInRelease)
         await releaseInput(at: \.micWiredRelease)
+        await releaseUSBMicIfLive()
+    }
+
+    /// `USB PnP` is OBS's global Aux Audio Device 1 slot (see CLAUDE.md's "OBS scenes &
+    /// sources" section) — not a scene item, so it can't go through the generic
+    /// `releaseInput`/`restoreInput` machinery above (built around `CreateInput`-into-a-scene).
+    /// It was never touched at idle before this, which left the physical mic device open (and
+    /// the macOS mic-in-use menu bar indicator lit) indefinitely after any recording that used
+    /// the USB mic, since — matching the same reasoning already documented for Macbook/
+    /// Headphones Mic — muting alone doesn't release the underlying CoreAudio device, only
+    /// silences it in the mix. Clearing `device_id` (rather than removing the input outright)
+    /// tells the plugin to close whatever device it's holding while leaving the named input
+    /// itself intact; `applyMicrophonePriority` already unconditionally rewrites a fresh
+    /// `device_id` (and unmutes) right before every recording start when a USB mic is present,
+    /// so there's nothing to snapshot/restore here the way there is for removed inputs.
+    private func releaseUSBMicIfLive() async {
+        let name = config.sources.micUSBSourceName
+        try? await obs.setInputMute(inputName: name, muted: true)
+        try? await obs.setInputSettings(inputName: name, settings: ["device_id": ""])
     }
 
     private func ensureIdleSceneExists() async throws {
