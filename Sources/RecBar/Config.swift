@@ -23,11 +23,18 @@ struct WatchdogConfig: Codable {
     var silenceDurationSeconds: Double
     var responseWindowSeconds: Double
 
+    // -50dB was the original guess and turned out to be unreachable in practice — a real
+    // recording analyzed 2026-08-28 (ffmpeg silencedetect against the saved file) never once
+    // dipped below -40dB even briefly, let alone continuously for silenceDurationSeconds. -35
+    // is still a deliberately conservative (quiet) pick based on that one sample; the debug
+    // drawer now shows each channel's live dB and highlights the watched mic red when it's
+    // under the configured threshold, specifically so this can be tuned per-room without
+    // needing to analyze a recording after the fact.
     static let defaultOn = WatchdogConfig(
-        enabled: true, silenceThresholdDB: -50, silenceDurationSeconds: 30, responseWindowSeconds: 60
+        enabled: true, silenceThresholdDB: -35, silenceDurationSeconds: 30, responseWindowSeconds: 60
     )
     static let defaultOff = WatchdogConfig(
-        enabled: false, silenceThresholdDB: -50, silenceDurationSeconds: 30, responseWindowSeconds: 60
+        enabled: false, silenceThresholdDB: -35, silenceDurationSeconds: 30, responseWindowSeconds: 60
     )
 }
 

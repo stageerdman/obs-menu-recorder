@@ -138,8 +138,8 @@ clears the deadline → recording continues. No confirmation before the deadline
 (so the file is always kept — `stop()` never quits OBS, same as any other stop), then posts a
 confirming notification.
 
-**Prompt not being noticed, root cause diagnosed but not yet re-verified end-to-end
-(2026-08-28).** User report: a real silence auto-stop fired with no warning seen or heard —
+**Prompt not being noticed, root cause confirmed and fix verified end-to-end (2026-08-28).**
+User report: a real silence auto-stop fired with no warning seen or heard —
 recording just stopped. Both the `UNUserNotificationCenter` banner and the inline popover
 banner are conditional in ways a real away-from-keyboard call can easily hit: the system
 notification depends on notification permission having actually been granted (requested once,
@@ -184,10 +184,42 @@ through the default system output device, which Sales/Other Call's `Desktop Soun
 (`sck_audio_capture`) source can pick up — so the repeating alert chime may itself get baked
 into the saved recording's audio while the prompt is active. Not addressed here since silencing
 the one channel proven to actually reach the user wasn't the right tradeoff, but worth knowing
-if a saved recording has an unexpected chime in it. Not yet walked end-to-end with real silence
-(needs the same real-audio verification already pending for the rest of this feature, see
-"Silence / presence watchdog" in Testing notes below) — only confirmed via `swift build -c
-release`.
+if a saved recording has an unexpected chime in it. **Verified end-to-end with real silence by
+the user (2026-08-28, after the -35dB threshold fix below): confirmed working perfectly** —
+the chime, the menu bar icon, and the top-right overlay panel all appeared as designed and the
+"I'm here" flow worked.
+
+**-50dB default threshold unreachable in practice, root cause confirmed from a real recording
+(2026-08-28).** User report: recorded 90+ real seconds of silence in a Sales Call and the
+watchdog never fired at all — not a missed-notification problem this time, the prompt itself
+never started. Root-caused by analyzing the actual saved file
+(`~/Documents/Recordings/Sales Meetings/2026-08-28 18-00-48.mov`) with `ffmpeg`'s
+`silencedetect` filter at several thresholds: the recording's noise floor never dropped below
+roughly -40dBFS for its entire 98s duration (zero silent stretches at -40dB or -50dB, even
+1s ones; -35dB fragmented into stretches no longer than ~18s; only -30dB and above produced a
+continuous stretch past the 30s `silenceDurationSeconds` requirement). So "-50dB for 30
+continuous seconds" was mathematically unreachable in this room/mic setup regardless of how
+quiet the user actually was — not a bug in the comparison logic itself. Caveat: OBS had
+written identical audio into all 6 output tracks in that file (every source apparently routed
+to every track, not split per-source), so this analysis is of the full mixed program audio
+(mic + `Desktop Sounds` together), not an isolated mic reading — the true mic-only floor could
+be somewhat different, but -50dB being unreachable is unlikely to be an artifact of that.
+Fixed two ways: (1) `WatchdogConfig.defaultOn`/`defaultOff` in `Config.swift` changed from
+-50dB to -35dB (a deliberately conservative pick based on this one sample — see the comment
+there), and the user's existing `config.json` was hand-updated to match for `salesMode`/
+`otherMode` (Guide stays at the old default since its watchdog is off anyway and the field is
+otherwise unused). (2) More durable fix: the debug drawer (`DebugDrawer` in
+`RecordingView.swift`) now shows each tracked channel's live level as an actual dB number
+(computed from `peakLevel` via `20*log10`), labels the specific channel the watchdog is
+reading `(watched)` (`AppState.resolvedMicSourceName` was `private`, changed to `private(set)`
+so the view can read it), and turns that row's text red in real time whenever it's actually
+under the active mode's configured threshold — so future threshold tuning can be done by
+watching a live number during a real quiet test instead of guessing from a recording
+afterward, which is how this bug had to be diagnosed in the first place. Rebuilt, installed to
+`/Applications/RecBar.app`, and relaunched. **Verified by the user (2026-08-28): confirmed
+working perfectly** — the prompt now actually fires at -35dB and the full watchdog flow
+(chime, menu bar icon, overlay panel, auto-stop) completed correctly. Case closed; no further
+action pending on the silence watchdog unless a future report reopens it.
 
 Suppression points, all of which clear `watchdogPromptDeadline` (never leave a prompt
 in-flight into a state where it shouldn't apply): entering `.paused` (manual or external),
@@ -413,31 +445,21 @@ walkthrough with the user:
   Guide recording before RecBar has ever seen the camera live — `restoreCameraForGuideMode()`
   should just no-op silently in that case, not block the recording from starting.
 
-**Silence / presence watchdog** (2026-08-21): built and config-migration-tested, but the
-actual silence → prompt → auto-stop timing sequence has **not yet** been walked end-to-end
-with real audio (needs someone to actually go quiet for 30+ real seconds, then either
-respond or let the 60s window elapse — not something to self-certify). Still needed with the
-user's help:
-- Confirm the inline "Are you there?" banner appears in the popover with a live countdown,
-  and that the macOS notification arrives with a working "I'm here" action (this needs
-  notification permission granted on first prompt — see README's Silence/presence watchdog
-  troubleshooting entry).
-- Confirm a response (either the inline button or the notification action) resets the clock
-  and recording continues, without a stray auto-stop landing right after.
-- Confirm letting the 60s window elapse actually stops the recording, **keeps** the file
-  (never discards), returns to View 1, and posts the auto-stop confirmation notification.
-- Confirm pausing mid-recording suppresses the watchdog (no prompt while paused even after
-  30+ silent seconds), and that resuming doesn't immediately re-trigger it.
-- Confirm Guide mode really doesn't prompt (watchdog off by default there), and that Sales
-  Call/Other Call do.
-- Confirm the `AlertSound` chime is actually audible when the prompt starts, repeats roughly
-  every 8s while unconfirmed, and stops immediately on confirmation or auto-stop; confirm the
-  menu bar icon switches to the orange warning triangle for the same duration, visible with
-  the popover closed; and confirm the `WatchdogOverlayWindow` red panel appears pinned to the
-  top-right corner of the screen, its countdown updates live, its "I'm here" button confirms
-  presence without stealing focus from whatever app/call is active, and — importantly — that
-  it still appears on top of a **full-screen** Zoom/Meet call, not just a windowed one (see
-  "Prompt not being noticed" above, 2026-08-28 fix, not yet verified with real silence).
+**Silence / presence watchdog — core flow verified end-to-end with real audio (2026-08-28).**
+Built and config-migration-tested since 2026-08-21; the actual silence → prompt → auto-stop
+sequence, including the -35dB threshold fix and all four alert channels (inline banner,
+notification, `AlertSound` chime, menu bar icon, top-right `WatchdogOverlayWindow`), was
+walked end-to-end by the user with real silence and **confirmed working perfectly** — see
+"Prompt not being noticed" and "-50dB default threshold unreachable" above. Case closed for
+the core flow. A few finer-grained edge cases from the original checklist were not
+specifically called out as tested and are worth keeping in mind if the watchdog is touched
+again or a new report comes in:
+- Whether the `WatchdogOverlayWindow` panel specifically survives a **full-screen** (not just
+  windowed) Zoom/Meet call — this was the whole reason for that panel's `.fullScreenAuxiliary`
+  collection behavior, but wasn't singled out in the confirmation.
+- Whether pausing mid-recording during an active prompt correctly suppresses it, and that
+  resuming doesn't immediately re-trigger.
+- Whether Guide mode still correctly never prompts (watchdog off by default there).
 - One bug already caught and fixed before any of the above: the initial migration path
   defaulted Guide's watchdog to "on" instead of "off" for pre-existing `config.json` files
   (see "Silence / presence watchdog" architecture section above) — this machine's real

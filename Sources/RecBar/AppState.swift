@@ -74,8 +74,9 @@ final class AppState: ObservableObject {
     private var elapsedTimer: Timer?
     /// The OBS input name of the mic source actually live for the current recording (e.g.
     /// the USB or built-in mic source, whichever MicrophonePriority resolved to) — the
-    /// watchdog only ever looks at this channel, never desktop audio.
-    private var resolvedMicSourceName: String?
+    /// watchdog only ever looks at this channel, never desktop audio. Exposed read-only so
+    /// the debug drawer can highlight this specific channel for threshold calibration.
+    private(set) var resolvedMicSourceName: String?
     /// Last time the resolved mic channel was at/above the watchdog threshold. Reset on
     /// recording start, on resume from pause, and on any presence confirmation.
     private var micLastAboveThresholdDate: Date?

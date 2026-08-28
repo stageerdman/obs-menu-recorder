@@ -1,4 +1,5 @@
 import SwiftUI
+import Foundation
 
 struct RecordingView: View {
     @EnvironmentObject var appState: AppState
@@ -129,6 +130,13 @@ private struct TransportButtonStyle: ButtonStyle {
 private struct DebugDrawer: View {
     @EnvironmentObject var appState: AppState
 
+    /// The active mode's configured silence threshold, so the watched mic's row can be
+    /// highlighted red in real time when it's actually under it — lets the threshold be
+    /// tuned by watching a live number instead of guessing from a recording afterward.
+    private var thresholdDB: Double? {
+        appState.currentMode?.config(appState.config).watchdog.silenceThresholdDB
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 6) {
@@ -146,20 +154,44 @@ private struct DebugDrawer: View {
                     .foregroundStyle(.secondary)
             }
 
+            if let thresholdDB {
+                Text("Watchdog threshold: \(Int(thresholdDB)) dB")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+
             if appState.channelLevels.isEmpty {
                 Text("No level data yet")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
             } else {
                 ForEach(appState.channelLevels) { channel in
+                    let isWatched = channel.name == appState.resolvedMicSourceName
+                    let db = Self.dbValue(for: channel.peakLevel)
+                    let belowThreshold = isWatched && thresholdDB.map { db < $0 } == true
                     VStack(alignment: .leading, spacing: 3) {
-                        Text(channel.name)
-                            .font(.caption2)
+                        HStack {
+                            Text(isWatched ? "\(channel.name) (watched)" : channel.name)
+                            Spacer()
+                            Text(Self.dbText(for: db))
+                                .font(.system(.caption2, design: .monospaced))
+                        }
+                        .font(.caption2)
+                        .foregroundStyle(belowThreshold ? RecBarColor.red : .secondary)
                         LevelMeter(level: channel.peakLevel)
                     }
                 }
             }
         }
+    }
+
+    private static func dbValue(for level: Float) -> Double {
+        guard level > 0.0001 else { return -96 }
+        return 20 * Double(log10(level))
+    }
+
+    private static func dbText(for db: Double) -> String {
+        db <= -96 ? "≤ -96 dB" : String(format: "%.0f dB", db)
     }
 }
 
