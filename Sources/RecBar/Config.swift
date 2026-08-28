@@ -13,9 +13,80 @@ struct SceneSourceNames: Codable {
     var desktopAudioSourceName: String
 }
 
+/// Per-mode silence/presence watchdog settings. While recording, if the resolved mic
+/// channel's live level stays below silenceThresholdDB for silenceDurationSeconds, RecBar
+/// prompts "Are you there?" and auto-stops (keeping the file) if there's no response within
+/// responseWindowSeconds. See AppState's watchdog methods.
+struct WatchdogConfig: Codable {
+    var enabled: Bool
+    var silenceThresholdDB: Double
+    var silenceDurationSeconds: Double
+    var responseWindowSeconds: Double
+
+    static let defaultOn = WatchdogConfig(
+        enabled: true, silenceThresholdDB: -50, silenceDurationSeconds: 30, responseWindowSeconds: 60
+    )
+    static let defaultOff = WatchdogConfig(
+        enabled: false, silenceThresholdDB: -50, silenceDurationSeconds: 30, responseWindowSeconds: 60
+    )
+}
+
+/// Governs releasing a capture resource (camera, screen capture, desktop audio) that OBS
+/// holds open regardless of which scene is active. `AppState.releaseInput(_:)` removes it
+/// whenever RecBar isn't recording and it isn't needed by the mode about to start, and
+/// `AppState.restoreInput(_:)` recreates it (from the settings/enabled-state/scene-item
+/// transform snapshotted the moment before removal — including transform so a manually
+/// resized/repositioned placement doesn't silently reset on every release/restore cycle)
+/// right before a recording that needs it starts. Camera (`macos-avcapture-fast`), screen
+/// capture (`screen_capture`), and desktop audio (`sck_audio_capture`) all use this same
+/// shape — see CLAUDE.md's "Idle resource minimization" for why each needs actual removal
+/// (not just a scene switch) to fully release, and why removal reliably needs cycling
+/// through every scene rather than just switching away and back once (confirmed via direct
+/// testing 2026-08-22).
+struct ReleasableInputConfig: Codable {
+    var enabled: Bool
+    var inputName: String
+    var sceneName: String
+    /// Snapshotted live, right before each removal, so recreation is identical to whatever
+    /// the source actually looked like — never hardcoded. Empty until the first snapshot.
+    var lastKnownInputKind: String
+    var lastKnownSettingsJSON: String
+    var lastKnownEnabled: Bool
+    var lastKnownTransformJSON: String
+
+    static func makeDefault(inputName: String, sceneName: String) -> ReleasableInputConfig {
+        ReleasableInputConfig(
+            enabled: true, inputName: inputName, sceneName: sceneName,
+            lastKnownInputKind: "", lastKnownSettingsJSON: "", lastKnownEnabled: false,
+            lastKnownTransformJSON: ""
+        )
+    }
+}
+
 struct ModeConfig: Codable {
     var sceneName: String
     var saveFolder: String
+    var watchdog: WatchdogConfig
+
+    enum CodingKeys: String, CodingKey {
+        case sceneName, saveFolder, watchdog
+    }
+
+    init(sceneName: String, saveFolder: String, watchdog: WatchdogConfig) {
+        self.sceneName = sceneName
+        self.saveFolder = saveFolder
+        self.watchdog = watchdog
+    }
+
+    /// Custom decoding so existing config.json files written before per-mode watchdog
+    /// settings existed still load their real sceneName/saveFolder instead of falling back
+    /// to defaults — only the new watchdog field defaults when absent.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        sceneName = try c.decode(String.self, forKey: .sceneName)
+        saveFolder = try c.decode(String.self, forKey: .saveFolder)
+        watchdog = try c.decodeIfPresent(WatchdogConfig.self, forKey: .watchdog) ?? .defaultOn
+    }
 }
 
 struct RecBarConfig: Codable {
@@ -26,6 +97,33 @@ struct RecBarConfig: Codable {
     var salesMode: ModeConfig
     var guideMode: ModeConfig
     var otherMode: ModeConfig
+    /// Scene RecBar switches OBS to whenever it isn't actively recording, to release
+    /// screen-capture/desktop-audio/scene-local-mic resources without quitting OBS (see
+    /// AppState.goIdleInOBS()). Auto-created via CreateScene if it doesn't already exist.
+    var idleSceneName: String
+    var cameraRelease: ReleasableInputConfig
+    /// Screen capture and desktop audio are only used by Sales Call/Other Call (both share
+    /// `Meet Recording Setup`) — Guide mode never touches either.
+    var screenRelease: ReleasableInputConfig
+    var desktopAudioRelease: ReleasableInputConfig
+    /// Unlike camera/screen/desktop-audio (each only ever live in one scene), the built-in
+    /// and wired mic sources are used by every mode, so they're live in whichever of the two
+    /// real scenes last needed them — `applyMicrophonePriority` mutes/unmutes them by the
+    /// same source name regardless of which scene is current. A first attempt gave each one
+    /// two `ReleasableInputConfig`s (one per scene, sharing an `inputName`) mirroring
+    /// screen/desktop-audio/camera's single-scene shape — that was wrong: since it's really
+    /// one shared global input, `goIdleInOBS` releasing the Meet entry before the Guide entry
+    /// meant the Meet copy always captured the live snapshot and the Guide copy's
+    /// `GetInputSettings` always found it already gone, so its snapshot stayed empty forever
+    /// and `restoreInput` for Guide silently no-op'd every time — Macbook/Headphones Mic never
+    /// came back in Guide Recording Setup, and `applyMicrophonePriority` then failed muting a
+    /// source that no longer existed ("OBS request failed (600): No source was found",
+    /// confirmed 2026-08-22, Guide-only). Fixed by using a single config per mic source and
+    /// passing the target scene explicitly at restore time (`AppState.restoreSharedMicInput`)
+    /// instead of baking it into `ReleasableInputConfig.sceneName` — correct because these are
+    /// audio-only sources with no meaningful per-scene transform to preserve anyway.
+    var micBuiltInRelease: ReleasableInputConfig
+    var micWiredRelease: ReleasableInputConfig
 
     static let `default` = RecBarConfig(
         obsHost: "127.0.0.1",
@@ -39,17 +137,96 @@ struct RecBarConfig: Codable {
         ),
         salesMode: ModeConfig(
             sceneName: "Meet Recording Setup",
-            saveFolder: "/Users/stage/Documents/Recordings/Sales Meetings"
+            saveFolder: "/Users/stage/Documents/Recordings/Sales Meetings",
+            watchdog: .defaultOn
         ),
         guideMode: ModeConfig(
             sceneName: "Guide Recording Setup",
-            saveFolder: "/Users/stage/Documents/Recordings/Guides"
+            saveFolder: "/Users/stage/Documents/Recordings/Guides",
+            // Off by default: Guide recordings are often narrated on-screen with long
+            // stretches of intentional on-mic silence, which isn't the "walked away" case
+            // the watchdog is meant to catch.
+            watchdog: .defaultOff
         ),
         otherMode: ModeConfig(
             sceneName: "Meet Recording Setup",
-            saveFolder: "/Users/stage/Documents/Recordings/Other Meetings"
-        )
+            saveFolder: "/Users/stage/Documents/Recordings/Other Meetings",
+            watchdog: .defaultOn
+        ),
+        idleSceneName: "RecBar Idle",
+        cameraRelease: .makeDefault(inputName: "Capture Card Device", sceneName: "Guide Recording Setup"),
+        screenRelease: .makeDefault(inputName: "Screen", sceneName: "Meet Recording Setup"),
+        desktopAudioRelease: .makeDefault(inputName: "Desktop Sounds", sceneName: "Meet Recording Setup"),
+        // sceneName here is unused (restoreSharedMicInput takes the target scene explicitly)
+        // — kept only because ReleasableInputConfig.makeDefault requires one.
+        micBuiltInRelease: .makeDefault(inputName: "Macbook", sceneName: "Meet Recording Setup"),
+        micWiredRelease: .makeDefault(inputName: "Headphones Mic", sceneName: "Meet Recording Setup")
     )
+
+    enum CodingKeys: String, CodingKey {
+        case obsHost, obsPort, obsPassword, sources, salesMode, guideMode, otherMode
+        case idleSceneName, cameraRelease, screenRelease, desktopAudioRelease
+        case micBuiltInRelease, micWiredRelease
+    }
+
+    init(obsHost: String, obsPort: Int, obsPassword: String, sources: SceneSourceNames,
+         salesMode: ModeConfig, guideMode: ModeConfig, otherMode: ModeConfig,
+         idleSceneName: String, cameraRelease: ReleasableInputConfig,
+         screenRelease: ReleasableInputConfig, desktopAudioRelease: ReleasableInputConfig,
+         micBuiltInRelease: ReleasableInputConfig, micWiredRelease: ReleasableInputConfig) {
+        self.obsHost = obsHost
+        self.obsPort = obsPort
+        self.obsPassword = obsPassword
+        self.sources = sources
+        self.salesMode = salesMode
+        self.guideMode = guideMode
+        self.otherMode = otherMode
+        self.idleSceneName = idleSceneName
+        self.cameraRelease = cameraRelease
+        self.screenRelease = screenRelease
+        self.desktopAudioRelease = desktopAudioRelease
+        self.micBuiltInRelease = micBuiltInRelease
+        self.micWiredRelease = micWiredRelease
+    }
+
+    /// Custom decoding so existing config.json files written before the per-mode watchdog
+    /// block (or the idle-scene/camera-release/screen-release/desktop-audio-release/
+    /// mic-release fields) existed still load (and keep their real host/port/password/etc.)
+    /// instead of silently falling back to RecBarConfig.default.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        obsHost = try c.decode(String.self, forKey: .obsHost)
+        obsPort = try c.decode(Int.self, forKey: .obsPort)
+        obsPassword = try c.decode(String.self, forKey: .obsPassword)
+        sources = try c.decode(SceneSourceNames.self, forKey: .sources)
+        // Decoded with an explicit per-mode default (rather than via ModeConfig's own
+        // Decodable init) because Guide's watchdog default differs from Sales/Other's —
+        // ModeConfig alone has no way to know which mode it's decoding.
+        salesMode = try Self.decodeModeConfig(c, forKey: .salesMode, defaultWatchdog: .defaultOn)
+        guideMode = try Self.decodeModeConfig(c, forKey: .guideMode, defaultWatchdog: .defaultOff)
+        otherMode = try Self.decodeModeConfig(c, forKey: .otherMode, defaultWatchdog: .defaultOn)
+        idleSceneName = try c.decodeIfPresent(String.self, forKey: .idleSceneName) ?? "RecBar Idle"
+        cameraRelease = try c.decodeIfPresent(ReleasableInputConfig.self, forKey: .cameraRelease)
+            ?? .makeDefault(inputName: "Capture Card Device", sceneName: "Guide Recording Setup")
+        screenRelease = try c.decodeIfPresent(ReleasableInputConfig.self, forKey: .screenRelease)
+            ?? .makeDefault(inputName: "Screen", sceneName: "Meet Recording Setup")
+        desktopAudioRelease = try c.decodeIfPresent(ReleasableInputConfig.self, forKey: .desktopAudioRelease)
+            ?? .makeDefault(inputName: "Desktop Sounds", sceneName: "Meet Recording Setup")
+        micBuiltInRelease = try c.decodeIfPresent(ReleasableInputConfig.self, forKey: .micBuiltInRelease)
+            ?? .makeDefault(inputName: "Macbook", sceneName: "Meet Recording Setup")
+        micWiredRelease = try c.decodeIfPresent(ReleasableInputConfig.self, forKey: .micWiredRelease)
+            ?? .makeDefault(inputName: "Headphones Mic", sceneName: "Meet Recording Setup")
+    }
+
+    private static func decodeModeConfig(
+        _ c: KeyedDecodingContainer<CodingKeys>, forKey key: CodingKeys, defaultWatchdog: WatchdogConfig
+    ) throws -> ModeConfig {
+        let nested = try c.nestedContainer(keyedBy: ModeConfig.CodingKeys.self, forKey: key)
+        let sceneName = try nested.decode(String.self, forKey: .sceneName)
+        let saveFolder = try nested.decode(String.self, forKey: .saveFolder)
+        let watchdog = try nested.decodeIfPresent(WatchdogConfig.self, forKey: .watchdog) ?? defaultWatchdog
+        return ModeConfig(sceneName: sceneName, saveFolder: saveFolder, watchdog: watchdog)
+    }
 }
 
 enum ConfigStore {
@@ -75,7 +252,25 @@ enum ConfigStore {
             NSLog("RecBar: config.json is invalid, falling back to defaults (not overwriting your file)")
             return .default
         }
+        // Migration: older config.json files predate the per-mode watchdog block and/or the
+        // idle-scene/camera-release fields. Persist the defaulted values so they become
+        // visible/editable in the user's own file.
+        if needsMigrationSave(rawData: data) {
+            save(decoded)
+        }
         return decoded
+    }
+
+    private static func needsMigrationSave(rawData: Data) -> Bool {
+        guard let json = try? JSONSerialization.jsonObject(with: rawData) as? [String: Any] else { return false }
+        if json["idleSceneName"] == nil || json["cameraRelease"] == nil
+            || json["screenRelease"] == nil || json["desktopAudioRelease"] == nil { return true }
+        if json["micBuiltInRelease"] == nil || json["micWiredRelease"] == nil { return true }
+        for key in ["salesMode", "guideMode", "otherMode"] {
+            guard let mode = json[key] as? [String: Any] else { continue }
+            if mode["watchdog"] == nil { return true }
+        }
+        return false
     }
 
     static func save(_ config: RecBarConfig) {

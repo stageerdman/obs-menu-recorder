@@ -41,5 +41,8 @@ if [[ "${1:-}" == "--install" ]]; then
     echo "==> installing to /Applications/$APP_NAME.app"
     rm -rf "/Applications/$APP_NAME.app"
     cp -R "$APP_BUNDLE" "/Applications/$APP_NAME.app"
+    # Don't leave the staging copy behind — a second .app named RecBar sitting under dist/
+    # shows up alongside the installed one in Spotlight/Launchpad, which is confusing.
+    rm -rf "$APP_BUNDLE"
     echo "==> installed: /Applications/$APP_NAME.app"
 fi

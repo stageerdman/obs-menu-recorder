@@ -23,7 +23,7 @@ struct SelectionView: View {
             .padding(16)
 
             if appState.connectionState != .connected {
-                Label("OBS not connected", systemImage: "exclamationmark.triangle.fill")
+                Label(appState.isBusy ? "Launching OBS…" : "OBS not connected", systemImage: "exclamationmark.triangle.fill")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
                     .padding(.bottom, 12)
@@ -38,7 +38,9 @@ private struct ModeButton: View {
     let mode: RecordingMode
     @State private var pressed = false
 
-    private var disabled: Bool { appState.connectionState != .connected || appState.isBusy }
+    // Not gated on connectionState: if OBS isn't connected yet (e.g. not running), clicking
+    // still needs to work so AppState.beginRecording can launch/wait for it.
+    private var disabled: Bool { appState.isBusy }
 
     var body: some View {
         Button {
@@ -65,7 +67,7 @@ private struct ModeButton: View {
         .buttonStyle(.plain)
         .opacity(disabled ? 0.5 : 1.0)
         .disabled(disabled)
-        .help(disabled ? "OBS not connected" : "")
+        .help(disabled ? "Working…" : "")
         .simultaneousGesture(
             DragGesture(minimumDistance: 0)
                 .onChanged { _ in pressed = true }

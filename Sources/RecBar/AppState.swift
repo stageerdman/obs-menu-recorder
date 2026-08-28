@@ -56,14 +56,48 @@ final class AppState: ObservableObject {
     @Published private(set) var channelLevels: [ChannelLevel] = []
     @Published private(set) var resolvedMicDescription: String?
     @Published private(set) var isBusy = false
+    /// Non-nil while the silence watchdog is waiting on a presence confirmation; the popover
+    /// shows a countdown to this deadline, after which the recording auto-stops.
+    @Published private(set) var watchdogPromptDeadline: Date?
 
-    let config: RecBarConfig
+    /// Not `let`: each `*Release` config's `lastKnown*` fields get updated (and persisted) in
+    /// place every time `releaseInput(at:)` snapshots that source before removing it.
+    private(set) var config: RecBarConfig
     private let obs: OBSClient
+    private let obsLauncher = OBSLauncher()
+    private let watchdogNotifier = WatchdogNotifier()
+    private let watchdogOverlay = WatchdogOverlayWindow()
 
     private var recordStartDate: Date?
     private var pausedAccumulated: TimeInterval = 0
     private var pauseStartDate: Date?
     private var elapsedTimer: Timer?
+    /// The OBS input name of the mic source actually live for the current recording (e.g.
+    /// the USB or built-in mic source, whichever MicrophonePriority resolved to) — the
+    /// watchdog only ever looks at this channel, never desktop audio.
+    private var resolvedMicSourceName: String?
+    /// Last time the resolved mic channel was at/above the watchdog threshold. Reset on
+    /// recording start, on resume from pause, and on any presence confirmation.
+    private var micLastAboveThresholdDate: Date?
+    /// Last time `AlertSound` was played for the in-flight watchdog prompt — nil while no
+    /// prompt is active. Repeating this (rather than a single chime at prompt start) is the
+    /// main fix for the prompt being missed entirely: a `UNUserNotificationCenter` banner
+    /// depends on notification permission having actually been granted (see WatchdogNotifier),
+    /// which is easy to have silently never happened, and the inline popover banner only shows
+    /// while the popover happens to be open — this alert sound needs neither.
+    private var lastWatchdogAlertSoundDate: Date?
+    /// How often `AlertSound` repeats while a watchdog prompt is unconfirmed.
+    private let watchdogAlertRepeatInterval: TimeInterval = 8
+    /// Tracks `goIdleInOBS()` whenever it's kicked off in the background (from `resetToIdle()`
+    /// — stop/external-stop/connect-time sync), so `beginRecording()` can wait for it to
+    /// actually finish before touching OBS itself. Without this, `resetToIdle()` returning
+    /// immediately (it can't await from a sync context) let `isBusy` clear while idle cleanup
+    /// was still mid-flight — cycling through every scene, up to 3 attempts per released
+    /// input — so a mode button pressed right after a stop (or right after connecting) raced
+    /// `SetCurrentProgramScene` calls against `beginRecording`'s own, sometimes landing the
+    /// new recording on the idle scene instead (observed 2026-08-22: Guide recording started
+    /// on an empty scene, OBS's camera source showing "no sources were found").
+    private var idleTransitionTask: Task<Void, Never>?
 
     private struct EventWaiter {
         let id: UUID
@@ -88,6 +122,8 @@ final class AppState: ObservableObject {
             self?.handleEvent(type: type, data: data)
         }
         obs.connect()
+
+        watchdogNotifier.onConfirm = { [weak self] in self?.confirmPresence() }
     }
 
     // MARK: - Startup / external-state sync
@@ -125,21 +161,54 @@ final class AppState: ObservableObject {
                 try await beginRecording(mode: mode)
             } catch {
                 errorMessage = error.localizedDescription
+                // A partial start (e.g. scene already switched, camera already recreated for
+                // Guide mode) shouldn't leave OBS sitting hot — recover back to idle.
+                await goIdleInOBS()
             }
         }
     }
 
     private func beginRecording(mode: RecordingMode) async throws {
+        // Let any in-flight idle cleanup (from a just-prior stop, or the connect-time sync)
+        // finish before this recording starts mutating OBS itself — see idleTransitionTask.
+        if let pending = idleTransitionTask {
+            await pending.value
+            idleTransitionTask = nil
+        }
+
+        var justLaunchedOBS = false
+        if connectionState != .connected {
+            justLaunchedOBS = try await ensureOBSRunningAndConnected()
+        }
         guard connectionState == .connected else {
             throw simpleError("OBS not connected")
+        }
+
+        // On a cold launch, OBS's own audio subsystem can still be mid-initialization for a
+        // moment right after the websocket handshake completes. Hitting it with
+        // SetInputSettings/SetInputMute that early has been observed to crash OBS outright
+        // (SIGSEGV inside obs_source_output_audio/copy_audio_data on the audio IO thread,
+        // reproduced consistently) — a short settle delay avoids that window. Only applied
+        // right after RecBar itself launched OBS, not on every recording start.
+        if justLaunchedOBS {
+            try await Task.sleep(nanoseconds: 3_000_000_000)
         }
 
         let resolved = try MicrophonePriority.resolve()
         let modeConfig = mode.config(config)
 
         try await obs.setCurrentProgramScene(modeConfig.sceneName)
+        if mode == .guide {
+            await restoreInput(at: \.cameraRelease)
+        } else {
+            await restoreInput(at: \.screenRelease)
+            await restoreInput(at: \.desktopAudioRelease)
+        }
+        // Shared across every mode — recreated into whichever real scene is current now.
+        await restoreInput(at: \.micBuiltInRelease, sceneNameOverride: modeConfig.sceneName)
+        await restoreInput(at: \.micWiredRelease, sceneNameOverride: modeConfig.sceneName)
         try await obs.setRecordDirectory(modeConfig.saveFolder)
-        try await applyMicrophonePriority(resolved)
+        try await applyMicrophonePriority(resolved, includeDesktopAudio: mode != .guide)
         try await obs.startRecord()
 
         let started = await waitForEvent("RecordStateChanged", timeout: 5) { data in
@@ -151,17 +220,29 @@ final class AppState: ObservableObject {
 
         currentMode = mode
         resolvedMicDescription = "\(resolved.deviceName) (\(resolved.role == .usb ? "USB" : "built-in"))"
+        resolvedMicSourceName = resolved.role == .usb ? config.sources.micUSBSourceName : config.sources.micBuiltInSourceName
         recordStartDate = Date()
         pausedAccumulated = 0
         pauseStartDate = nil
+        micLastAboveThresholdDate = Date()
         recordingState = .recording
         startElapsedTimerIfNeeded()
     }
 
-    /// Mutes every configured mic source except the one that should be active, and always
-    /// keeps desktop audio unmuted. Re-writes the USB source's device_id every time, since
-    /// OBS's saved device_id can go stale between physical (dis)connects.
-    private func applyMicrophonePriority(_ resolved: ResolvedMic) async throws {
+    /// Mutes every configured mic source except the one that should be active, and (for modes
+    /// that actually have it live — see `includeDesktopAudio`) keeps desktop audio unmuted.
+    /// Re-writes the USB source's device_id every time, since OBS's saved device_id can go
+    /// stale between physical (dis)connects.
+    ///
+    /// `includeDesktopAudio` must be `false` for Guide mode: `desktopAudioSourceName`
+    /// ("Desktop Sounds") is only ever restored in the Sales/Other Call branch of
+    /// `beginRecording` (Guide never uses it — see `config.desktopAudioRelease`), and
+    /// `goIdleInOBS` unconditionally releases it on every idle transition. So after any idle
+    /// transition following a Sales/Other Call recording, the source no longer exists at all
+    /// by the time a Guide recording starts — muting it unconditionally here failed with
+    /// "OBS request failed (600): No source was found" (confirmed 2026-08-22; Guide was the
+    /// only mode that could ever hit this, since it's the only one that skips restoring it).
+    private func applyMicrophonePriority(_ resolved: ResolvedMic, includeDesktopAudio: Bool) async throws {
         let sources = config.sources
 
         if resolved.role == .usb {
@@ -171,7 +252,266 @@ final class AppState: ObservableObject {
         try await obs.setInputMute(inputName: sources.micUSBSourceName, muted: resolved.role != .usb)
         try await obs.setInputMute(inputName: sources.micBuiltInSourceName, muted: resolved.role != .builtIn)
         try await obs.setInputMute(inputName: sources.micWiredSourceName, muted: true)
-        try await obs.setInputMute(inputName: sources.desktopAudioSourceName, muted: false)
+        if includeDesktopAudio {
+            try await obs.setInputMute(inputName: sources.desktopAudioSourceName, muted: false)
+        }
+    }
+
+    // MARK: - Idle resource minimization
+
+    /// Switches OBS to an (auto-created) empty scene and releases the camera, screen capture,
+    /// and desktop audio whenever RecBar isn't actively recording, so a never-quit OBS doesn't
+    /// sit indefinitely on a scene with live capture. Called from `resetToIdle()` (every path
+    /// back to idle) and from a failed `start()` (to recover from a partial setup).
+    private func goIdleInOBS() async {
+        guard connectionState == .connected else { return }
+        do {
+            try await ensureIdleSceneExists()
+            try await obs.setCurrentProgramScene(config.idleSceneName)
+        } catch {
+            NSLog("RecBar: failed to switch OBS to its idle scene: \(error)")
+        }
+        await releaseInput(at: \.cameraRelease)
+        await releaseInput(at: \.screenRelease)
+        await releaseInput(at: \.desktopAudioRelease)
+        await releaseInput(at: \.micBuiltInRelease)
+        await releaseInput(at: \.micWiredRelease)
+    }
+
+    private func ensureIdleSceneExists() async throws {
+        let scenes = try await obs.getSceneList()
+        guard !scenes.contains(config.idleSceneName) else { return }
+        try await obs.createScene(config.idleSceneName)
+    }
+
+    /// Scene item transform keys that SetSceneItemTransform actually accepts — GetSceneItemList
+    /// also returns several read-only computed ones (sourceWidth/sourceHeight/width/height)
+    /// that describe the source's native size, not something to send back.
+    private static let writableTransformKeys: Set<String> = [
+        "positionX", "positionY", "rotation", "scaleX", "scaleY", "alignment",
+        "boundsType", "boundsAlignment", "boundsWidth", "boundsHeight",
+        "cropTop", "cropBottom", "cropLeft", "cropRight", "cropToBounds"
+    ]
+
+    /// Switches through every existing scene, ending back on the idle scene. `RemoveInput` has
+    /// been observed (2026-08-22) to return success while leaving the underlying capture
+    /// session running indefinitely — reproduced directly against a live instance for the
+    /// camera (`macos-avcapture-fast`), stuck 10+ minutes and multiple bare retries, after the
+    /// source had been through one real recording; and for screen capture/desktop audio
+    /// (`screen_capture`/`sck_audio_capture`), where merely switching away from and back to the
+    /// idle scene (two scenes) wasn't enough either. `RemoveInput` appears to only queue the
+    /// removal, and cycling through every scene — not just waiting, and not just one switch —
+    /// is what reliably flushes it.
+    private func cycleAllScenesEndingOnIdle() async {
+        let scenes = (try? await obs.getSceneList()) ?? [config.idleSceneName]
+        for scene in scenes {
+            try? await obs.setCurrentProgramScene(scene)
+            try? await Task.sleep(nanoseconds: 400_000_000)
+        }
+        try? await obs.setCurrentProgramScene(config.idleSceneName)
+        try? await Task.sleep(nanoseconds: 400_000_000)
+    }
+
+    /// Removes a capture input entirely — confirmed via direct testing (2026-08-22, see
+    /// CLAUDE.md) that a scene switch alone doesn't release the camera's AVCaptureSession, and
+    /// only fully stops screen capture/desktop audio's ScreenCaptureKit session once actually
+    /// removed too. Snapshots current kind/settings/enabled state/scene-item placement first —
+    /// including placement, so a manually resized or repositioned source doesn't silently reset
+    /// on the next `restoreInput` — so it can be recreated identically. No-ops if it's already
+    /// gone (e.g. a second idle transition in a row) or not configured for release.
+    private func releaseInput(at keyPath: WritableKeyPath<RecBarConfig, ReleasableInputConfig>) async {
+        let inputConfig = config[keyPath: keyPath]
+        guard inputConfig.enabled else { return }
+        guard let (kind, settings) = try? await obs.getInputSettings(inputName: inputConfig.inputName) else {
+            return
+        }
+        var enabled = inputConfig.lastKnownEnabled
+        var transform: [String: Any]?
+        if let item = try? await obs.findSceneItem(sceneName: inputConfig.sceneName, sourceName: inputConfig.inputName) {
+            enabled = item.enabled
+            transform = item.transform.filter { Self.writableTransformKeys.contains($0.key) }
+        }
+        if let data = try? JSONSerialization.data(withJSONObject: settings),
+           let json = String(data: data, encoding: .utf8) {
+            config[keyPath: keyPath].lastKnownInputKind = kind
+            config[keyPath: keyPath].lastKnownSettingsJSON = json
+            config[keyPath: keyPath].lastKnownEnabled = enabled
+            if let transform, let transformData = try? JSONSerialization.data(withJSONObject: transform),
+               let transformJSON = String(data: transformData, encoding: .utf8) {
+                config[keyPath: keyPath].lastKnownTransformJSON = transformJSON
+            }
+            ConfigStore.save(config)
+        }
+
+        let name = inputConfig.inputName
+        for attempt in 1...3 {
+            try? await obs.removeInput(inputName: name)
+            await cycleAllScenesEndingOnIdle()
+            guard let inputs = try? await obs.getInputList(), inputs.contains(name) else {
+                return // gone — done
+            }
+            NSLog("RecBar: \(name) still present after RemoveInput attempt \(attempt)/3")
+        }
+        NSLog("RecBar: failed to release \(name) after 3 attempts (including scene-cycle "
+              + "nudges) — OBS accepted the RemoveInput request but the resource is still held "
+              + "open. Quitting and relaunching OBS is the only other confirmed way to clear it.")
+    }
+
+    /// Recreates an input from its last snapshot, right before a recording that needs it
+    /// starts. A no-op if it was never seen live (nothing to snapshot from yet), if it's
+    /// already present (e.g. the user added it back manually), or not configured for release.
+    ///
+    /// `sceneNameOverride` lets a caller recreate the input into a different scene than the
+    /// one it was last snapshotted from — used for the shared mic sources (`micBuiltInRelease`
+    /// /`micWiredRelease`), which are a single config despite being usable from either real
+    /// scene (see the doc comment on `RecBarConfig.micBuiltInRelease` for why they aren't
+    /// split per-scene like camera/screen/desktop-audio). `enabled`/transform are reused as-is
+    /// regardless of target scene, which is fine for these — audio-only sources have no
+    /// meaningful visual placement.
+    private func restoreInput(at keyPath: WritableKeyPath<RecBarConfig, ReleasableInputConfig>, sceneNameOverride: String? = nil) async {
+        let inputConfig = config[keyPath: keyPath]
+        let sceneName = sceneNameOverride ?? inputConfig.sceneName
+        guard inputConfig.enabled else { return }
+        guard !inputConfig.lastKnownInputKind.isEmpty,
+              let data = inputConfig.lastKnownSettingsJSON.data(using: .utf8),
+              let settings = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
+            return
+        }
+        do {
+            let existing = try await obs.getInputList()
+            guard !existing.contains(inputConfig.inputName) else { return }
+            guard let itemId = try await obs.createInput(
+                sceneName: sceneName, inputName: inputConfig.inputName,
+                inputKind: inputConfig.lastKnownInputKind, settings: settings
+            ) else { return }
+            try await obs.setSceneItemEnabled(sceneName: sceneName, sceneItemId: itemId, enabled: inputConfig.lastKnownEnabled)
+            if let transformData = inputConfig.lastKnownTransformJSON.data(using: .utf8),
+               var transform = (try? JSONSerialization.jsonObject(with: transformData)) as? [String: Any],
+               !transform.isEmpty {
+                // OBS rejects boundsWidth/boundsHeight < 1 even when boundsType is NONE
+                // (confirmed 2026-08-22 testing the audio-only Desktop Sounds source, which has
+                // no intrinsic size) — drop them in that case since they're unused anyway.
+                if (transform["boundsType"] as? String) == "OBS_BOUNDS_NONE" {
+                    transform.removeValue(forKey: "boundsWidth")
+                    transform.removeValue(forKey: "boundsHeight")
+                }
+                try await obs.setSceneItemTransform(sceneName: sceneName, sceneItemId: itemId, transform: transform)
+            }
+        } catch {
+            NSLog("RecBar: failed to restore \(inputConfig.inputName): \(error)")
+        }
+    }
+
+    /// Launches OBS hidden if it isn't running yet (no-ops, and claims no ownership, if it's
+    /// already open — see OBSLauncher), then waits for the websocket connection to come up.
+    /// Returns whether RecBar performed a fresh launch (vs. OBS already being up).
+    @discardableResult
+    private func ensureOBSRunningAndConnected() async throws -> Bool {
+        let didLaunch: Bool
+        if !obsLauncher.isOBSRunning() {
+            try await obsLauncher.launchHiddenIfNeeded()
+            didLaunch = true
+        } else {
+            didLaunch = false
+        }
+        obs.reconnectNow()
+
+        let deadline = Date().addingTimeInterval(45)
+        while connectionState != .connected {
+            if Date() >= deadline {
+                // The most common cause is OBS's own "did not shut down properly, start in
+                // Safe Mode?" dialog blocking obs-websocket from coming up — invisible while
+                // OBS sits hidden with no Dock icon, so surface the window rather than just
+                // failing silently a second time.
+                obsLauncher.bringToForegroundIfLaunchedByUs()
+                throw simpleError(
+                    "Timed out waiting for OBS to start and connect. If OBS just launched, check "
+                    + "for a \"did not shut down properly\" dialog — RecBar brought it to the "
+                    + "foreground; click \"Run in Normal Mode\" and try again."
+                )
+            }
+            try await Task.sleep(nanoseconds: 200_000_000)
+        }
+        return didLaunch
+    }
+
+    // MARK: - Silence / presence watchdog
+
+    /// Runs once a second while actively recording (never while paused — see tickElapsed).
+    /// Tracks how long the resolved mic channel has stayed below the configured threshold
+    /// and, once it's been silent long enough, opens (or times out) the presence prompt.
+    private func tickWatchdog() {
+        guard let currentMode else { return }
+        let watchdog = currentMode.config(config).watchdog
+        guard watchdog.enabled else {
+            if watchdogPromptDeadline != nil { clearWatchdogPrompt() }
+            return
+        }
+
+        let now = Date()
+
+        if let deadline = watchdogPromptDeadline {
+            if now >= deadline {
+                autoStopForSilence()
+                return
+            }
+            // Repeat the alert chime for as long as the prompt is unconfirmed, rather than
+            // once at the start — the whole point is to be noticed even away from the screen.
+            if lastWatchdogAlertSoundDate.map({ now.timeIntervalSince($0) >= watchdogAlertRepeatInterval }) ?? true {
+                lastWatchdogAlertSoundDate = now
+                AlertSound.play()
+            }
+            return
+        }
+
+        let thresholdMul = Self.dbToLinear(watchdog.silenceThresholdDB)
+        if let level = currentMicLevel(), level >= thresholdMul {
+            micLastAboveThresholdDate = now
+            return
+        }
+
+        let lastAbove = micLastAboveThresholdDate ?? now
+        if now.timeIntervalSince(lastAbove) >= watchdog.silenceDurationSeconds {
+            let deadline = now.addingTimeInterval(watchdog.responseWindowSeconds)
+            watchdogPromptDeadline = deadline
+            watchdogNotifier.postPrompt(responseWindowSeconds: watchdog.responseWindowSeconds)
+            watchdogOverlay.show(deadline: deadline) { [weak self] in self?.confirmPresence() }
+        }
+    }
+
+    private func currentMicLevel() -> Float? {
+        guard let resolvedMicSourceName else { return nil }
+        return channelLevels.first(where: { $0.name == resolvedMicSourceName })?.peakLevel
+    }
+
+    private static func dbToLinear(_ db: Double) -> Float {
+        Float(pow(10.0, db / 20.0))
+    }
+
+    /// Confirms presence — from the inline "I'm here" button or the notification action —
+    /// resetting the silence clock and letting the recording continue normally.
+    func confirmPresence() {
+        guard watchdogPromptDeadline != nil else { return }
+        clearWatchdogPrompt()
+        micLastAboveThresholdDate = Date()
+    }
+
+    private func clearWatchdogPrompt() {
+        guard watchdogPromptDeadline != nil else { return }
+        watchdogPromptDeadline = nil
+        lastWatchdogAlertSoundDate = nil
+        watchdogNotifier.clearPrompt()
+        watchdogOverlay.hide()
+    }
+
+    /// The response window elapsed with no confirmation: stop the recording (keeping the
+    /// file — never discard), drop back to View 1, and confirm via notification why it
+    /// happened, since the popover may not be open to see it.
+    private func autoStopForSilence() {
+        guard watchdogPromptDeadline != nil, recordingState == .recording else { return }
+        clearWatchdogPrompt()
+        stop(discard: false)
+        watchdogNotifier.postAutoStopped()
     }
 
     // MARK: - Transport controls
@@ -188,6 +528,9 @@ final class AppState: ObservableObject {
                     _ = await waitForEvent("RecordStateChanged", timeout: 5) { ($0["outputState"] as? String) == "OBS_WEBSOCKET_OUTPUT_PAUSED" }
                     pauseStartDate = Date()
                     recordingState = .paused
+                    // The watchdog is suppressed while paused (see tickElapsed); clear any
+                    // in-flight prompt so it doesn't resolve to an auto-stop during the pause.
+                    clearWatchdogPrompt()
                 } else {
                     try await obs.resumeRecord()
                     _ = await waitForEvent("RecordStateChanged", timeout: 5) { ($0["outputState"] as? String) == "OBS_WEBSOCKET_OUTPUT_RESUMED" }
@@ -196,6 +539,8 @@ final class AppState: ObservableObject {
                     }
                     pauseStartDate = nil
                     recordingState = .recording
+                    // Start the silence clock fresh on resume rather than counting the pause itself.
+                    micLastAboveThresholdDate = Date()
                 }
             } catch {
                 errorMessage = error.localizedDescription
@@ -222,6 +567,7 @@ final class AppState: ObservableObject {
                 }
 
                 resetToIdle()
+                // RecBar never quits OBS itself (see OBSLauncher) — the user quits it manually.
             } catch {
                 errorMessage = error.localizedDescription
             }
@@ -232,12 +578,16 @@ final class AppState: ObservableObject {
         recordingState = .idle
         currentMode = nil
         resolvedMicDescription = nil
+        resolvedMicSourceName = nil
         recordStartDate = nil
         pauseStartDate = nil
         pausedAccumulated = 0
         elapsed = 0
         channelLevels = []
         stopElapsedTimer()
+        clearWatchdogPrompt()
+        micLastAboveThresholdDate = nil
+        idleTransitionTask = Task { [weak self] in await self?.goIdleInOBS() }
     }
 
     // MARK: - Elapsed timer
@@ -260,9 +610,10 @@ final class AppState: ObservableObject {
     private func tickElapsed() {
         guard let recordStartDate else { return }
         if recordingState == .paused {
-            return // frozen while paused
+            return // frozen while paused — the watchdog is suppressed along with it
         }
         elapsed = Date().timeIntervalSince(recordStartDate) - pausedAccumulated
+        tickWatchdog()
     }
 
     // MARK: - Events from OBS
@@ -305,8 +656,10 @@ final class AppState: ObservableObject {
             }
         case "OBS_WEBSOCKET_OUTPUT_PAUSED":
             recordingState = .paused
+            clearWatchdogPrompt()
         case "OBS_WEBSOCKET_OUTPUT_RESUMED":
             recordingState = .recording
+            micLastAboveThresholdDate = Date()
         default:
             break
         }

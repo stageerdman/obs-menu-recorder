@@ -5,6 +5,12 @@ struct RecordingView: View {
 
     var body: some View {
         VStack(spacing: 0) {
+            if let deadline = appState.watchdogPromptDeadline {
+                WatchdogBanner(deadline: deadline)
+                    .padding(.horizontal, 14)
+                    .padding(.top, 14)
+            }
+
             HStack(spacing: 16) {
                 Button {
                     ClickSound.play()
@@ -67,6 +73,41 @@ struct RecordingView: View {
         let total = max(0, Int(appState.elapsed))
         let h = total / 3600, m = (total % 3600) / 60, s = total % 60
         return String(format: "%02d:%02d:%02d", h, m, s)
+    }
+}
+
+private struct WatchdogBanner: View {
+    @EnvironmentObject var appState: AppState
+    let deadline: Date
+
+    private var remainingSeconds: Int {
+        max(0, Int(deadline.timeIntervalSinceNow.rounded(.up)))
+    }
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "waveform.slash")
+                .foregroundStyle(RecBarColor.red)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Are you there?")
+                    .font(.system(size: 12, weight: .semibold))
+                Text("No mic activity — auto-stopping in \(remainingSeconds)s")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+            Button("I'm here") {
+                ClickSound.play()
+                appState.confirmPresence()
+            }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.small)
+        }
+        .padding(10)
+        .background(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(RecBarColor.red.opacity(0.12))
+        )
     }
 }
 

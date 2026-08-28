@@ -78,6 +78,15 @@ final class OBSClient {
         connectionState = .disconnected
     }
 
+    /// Skips the rest of the current backoff delay and tries connecting immediately. Used
+    /// right after RecBar launches (or detects) an OBS instance, instead of waiting out
+    /// whatever reconnect delay had already been building up.
+    func reconnectNow() {
+        guard wantsConnection, connectionState == .disconnected else { return }
+        reconnectAttempt = 0
+        openSocket()
+    }
+
     private func openSocket() {
         guard let url = URL(string: "ws://\(host):\(port)") else { return }
         connectionState = .connecting
@@ -284,5 +293,77 @@ final class OBSClient {
             active: response["outputActive"] as? Bool ?? false,
             paused: response["outputPaused"] as? Bool ?? false
         )
+    }
+
+    // MARK: - Idle-scene / camera-release requests
+
+    func getSceneList() async throws -> [String] {
+        let response = try await request("GetSceneList")
+        let scenes = response["scenes"] as? [[String: Any]] ?? []
+        return scenes.compactMap { $0["sceneName"] as? String }
+    }
+
+    func createScene(_ name: String) async throws {
+        try await request("CreateScene", data: ["sceneName": name])
+    }
+
+    func getInputList() async throws -> [String] {
+        let response = try await request("GetInputList")
+        let inputs = response["inputs"] as? [[String: Any]] ?? []
+        return inputs.compactMap { $0["inputName"] as? String }
+    }
+
+    func getInputSettings(inputName: String) async throws -> (kind: String, settings: [String: Any]) {
+        let response = try await request("GetInputSettings", data: ["inputName": inputName])
+        return (response["inputKind"] as? String ?? "", response["inputSettings"] as? [String: Any] ?? [:])
+    }
+
+    func removeInput(inputName: String) async throws {
+        try await request("RemoveInput", data: ["inputName": inputName])
+    }
+
+    /// Returns the new scene item's ID.
+    @discardableResult
+    func createInput(sceneName: String, inputName: String, inputKind: String, settings: [String: Any]) async throws -> Int? {
+        let response = try await request("CreateInput", data: [
+            "sceneName": sceneName,
+            "inputName": inputName,
+            "inputKind": inputKind,
+            "inputSettings": settings
+        ])
+        return response["sceneItemId"] as? Int
+    }
+
+    struct SceneItemInfo {
+        let sceneItemId: Int
+        let enabled: Bool
+        let transform: [String: Any]
+    }
+
+    /// Finds a scene item by its source name. Returns nil if that source isn't in the scene.
+    func findSceneItem(sceneName: String, sourceName: String) async throws -> SceneItemInfo? {
+        let response = try await request("GetSceneItemList", data: ["sceneName": sceneName])
+        let items = response["sceneItems"] as? [[String: Any]] ?? []
+        guard let item = items.first(where: { ($0["sourceName"] as? String) == sourceName }),
+              let id = item["sceneItemId"] as? Int else {
+            return nil
+        }
+        return SceneItemInfo(
+            sceneItemId: id,
+            enabled: item["sceneItemEnabled"] as? Bool ?? true,
+            transform: item["sceneItemTransform"] as? [String: Any] ?? [:]
+        )
+    }
+
+    func setSceneItemEnabled(sceneName: String, sceneItemId: Int, enabled: Bool) async throws {
+        try await request("SetSceneItemEnabled", data: [
+            "sceneName": sceneName, "sceneItemId": sceneItemId, "sceneItemEnabled": enabled
+        ])
+    }
+
+    func setSceneItemTransform(sceneName: String, sceneItemId: Int, transform: [String: Any]) async throws {
+        try await request("SetSceneItemTransform", data: [
+            "sceneName": sceneName, "sceneItemId": sceneItemId, "sceneItemTransform": transform
+        ])
     }
 }
