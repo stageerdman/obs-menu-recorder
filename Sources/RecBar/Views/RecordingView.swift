@@ -166,7 +166,7 @@ private struct DebugDrawer: View {
                     .foregroundStyle(.secondary)
             } else {
                 ForEach(appState.channelLevels) { channel in
-                    let isWatched = channel.name == appState.resolvedMicSourceName
+                    let isWatched = appState.watchdogChannelNames.contains(channel.name)
                     let db = Self.dbValue(for: channel.peakLevel)
                     let belowThreshold = isWatched && thresholdDB.map { db < $0 } == true
                     VStack(alignment: .leading, spacing: 3) {

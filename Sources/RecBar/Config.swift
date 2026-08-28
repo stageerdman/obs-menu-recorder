@@ -13,15 +13,44 @@ struct SceneSourceNames: Codable {
     var desktopAudioSourceName: String
 }
 
-/// Per-mode silence/presence watchdog settings. While recording, if the resolved mic
-/// channel's live level stays below silenceThresholdDB for silenceDurationSeconds, RecBar
-/// prompts "Are you there?" and auto-stops (keeping the file) if there's no response within
-/// responseWindowSeconds. See AppState's watchdog methods.
+/// Per-mode silence/presence watchdog settings. While recording, if every currently-active
+/// audio channel (the resolved mic plus desktop audio, whichever are actually unmuted for
+/// the mode — see `AppState.watchdogChannelNames`) stays below silenceThresholdDB for
+/// silenceDurationSeconds, RecBar prompts "Are you there?" and auto-stops (keeping the file)
+/// if there's no response within responseWindowSeconds. A confirmed "I'm here" buys
+/// confirmExtensionSeconds of slack from the moment of the press instead of the normal
+/// silenceDurationSeconds — see AppState.tickWatchdog/confirmPresence for the "later deadline
+/// wins" logic between the two.
 struct WatchdogConfig: Codable {
     var enabled: Bool
     var silenceThresholdDB: Double
     var silenceDurationSeconds: Double
     var responseWindowSeconds: Double
+    var confirmExtensionSeconds: Double
+
+    enum CodingKeys: String, CodingKey {
+        case enabled, silenceThresholdDB, silenceDurationSeconds, responseWindowSeconds, confirmExtensionSeconds
+    }
+
+    init(enabled: Bool, silenceThresholdDB: Double, silenceDurationSeconds: Double,
+         responseWindowSeconds: Double, confirmExtensionSeconds: Double) {
+        self.enabled = enabled
+        self.silenceThresholdDB = silenceThresholdDB
+        self.silenceDurationSeconds = silenceDurationSeconds
+        self.responseWindowSeconds = responseWindowSeconds
+        self.confirmExtensionSeconds = confirmExtensionSeconds
+    }
+
+    /// Custom decoding so config.json files written before confirmExtensionSeconds existed
+    /// still load their real values for every other field, defaulting only the new one.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        enabled = try c.decode(Bool.self, forKey: .enabled)
+        silenceThresholdDB = try c.decode(Double.self, forKey: .silenceThresholdDB)
+        silenceDurationSeconds = try c.decode(Double.self, forKey: .silenceDurationSeconds)
+        responseWindowSeconds = try c.decode(Double.self, forKey: .responseWindowSeconds)
+        confirmExtensionSeconds = try c.decodeIfPresent(Double.self, forKey: .confirmExtensionSeconds) ?? 420
+    }
 
     // -50dB was the original guess and turned out to be unreachable in practice — a real
     // recording analyzed 2026-08-28 (ffmpeg silencedetect against the saved file) never once
@@ -30,11 +59,18 @@ struct WatchdogConfig: Codable {
     // drawer now shows each channel's live dB and highlights the watched mic red when it's
     // under the configured threshold, specifically so this can be tuned per-room without
     // needing to analyze a recording after the fact.
+    //
+    // silenceDurationSeconds defaults to 3 minutes and confirmExtensionSeconds to 7 (both
+    // 2026-08-28, per explicit user request) — long enough that normal conversational pauses
+    // never trip it, with a confirmed "I'm here" buying extra headroom since the user has just
+    // demonstrated they're mid-call, not idle.
     static let defaultOn = WatchdogConfig(
-        enabled: true, silenceThresholdDB: -35, silenceDurationSeconds: 30, responseWindowSeconds: 60
+        enabled: true, silenceThresholdDB: -35, silenceDurationSeconds: 180,
+        responseWindowSeconds: 60, confirmExtensionSeconds: 420
     )
     static let defaultOff = WatchdogConfig(
-        enabled: false, silenceThresholdDB: -35, silenceDurationSeconds: 30, responseWindowSeconds: 60
+        enabled: false, silenceThresholdDB: -35, silenceDurationSeconds: 180,
+        responseWindowSeconds: 60, confirmExtensionSeconds: 420
     )
 }
 
@@ -275,7 +311,8 @@ enum ConfigStore {
         if json["micBuiltInRelease"] == nil || json["micWiredRelease"] == nil { return true }
         for key in ["salesMode", "guideMode", "otherMode"] {
             guard let mode = json[key] as? [String: Any] else { continue }
-            if mode["watchdog"] == nil { return true }
+            guard let watchdog = mode["watchdog"] as? [String: Any] else { return true }
+            if watchdog["confirmExtensionSeconds"] == nil { return true }
         }
         return false
     }

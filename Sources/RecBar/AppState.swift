@@ -73,13 +73,24 @@ final class AppState: ObservableObject {
     private var pauseStartDate: Date?
     private var elapsedTimer: Timer?
     /// The OBS input name of the mic source actually live for the current recording (e.g.
-    /// the USB or built-in mic source, whichever MicrophonePriority resolved to) — the
-    /// watchdog only ever looks at this channel, never desktop audio. Exposed read-only so
-    /// the debug drawer can highlight this specific channel for threshold calibration.
+    /// the USB or built-in mic source, whichever MicrophonePriority resolved to). Exposed
+    /// read-only so the debug drawer can highlight this specific channel for threshold
+    /// calibration.
     private(set) var resolvedMicSourceName: String?
-    /// Last time the resolved mic channel was at/above the watchdog threshold. Reset on
-    /// recording start, on resume from pause, and on any presence confirmation.
+    /// Every channel the watchdog treats as "presence" for the current recording — the
+    /// resolved mic plus desktop audio for Sales/Other Call (Guide never has desktop audio
+    /// live at all). Deliberately excludes the *other*, muted mic source: a muted source can
+    /// still pick up ambient room noise even though it contributes nothing to the actual
+    /// recording, which would mask real silence on the channels that matter. Set in
+    /// `beginRecording`, cleared in `resetToIdle`.
+    private(set) var watchdogChannelNames: Set<String> = []
+    /// Last time any channel in `watchdogChannelNames` was at/above the watchdog threshold.
+    /// Reset on recording start, on resume from pause, and on any presence confirmation.
     private var micLastAboveThresholdDate: Date?
+    /// Non-nil after a presence confirmation ("I'm here") until either it's reached or a
+    /// fresh burst of real activity pushes the ordinary silence deadline past it — see
+    /// `confirmPresence()` and `tickWatchdog()`'s "later deadline wins" comparison.
+    private var watchdogExtendedDeadline: Date?
     /// Last time `AlertSound` was played for the in-flight watchdog prompt — nil while no
     /// prompt is active. Repeating this (rather than a single chime at prompt start) is the
     /// main fix for the prompt being missed entirely: a `UNUserNotificationCenter` banner
@@ -222,6 +233,10 @@ final class AppState: ObservableObject {
         currentMode = mode
         resolvedMicDescription = "\(resolved.deviceName) (\(resolved.role == .usb ? "USB" : "built-in"))"
         resolvedMicSourceName = resolved.role == .usb ? config.sources.micUSBSourceName : config.sources.micBuiltInSourceName
+        watchdogChannelNames = Set([resolvedMicSourceName].compactMap { $0 })
+        if mode != .guide {
+            watchdogChannelNames.insert(config.sources.desktopAudioSourceName)
+        }
         recordStartDate = Date()
         pausedAccumulated = 0
         pauseStartDate = nil
@@ -439,8 +454,21 @@ final class AppState: ObservableObject {
     // MARK: - Silence / presence watchdog
 
     /// Runs once a second while actively recording (never while paused — see tickElapsed).
-    /// Tracks how long the resolved mic channel has stayed below the configured threshold
-    /// and, once it's been silent long enough, opens (or times out) the presence prompt.
+    /// Tracks how long every channel in `watchdogChannelNames` has stayed below the
+    /// configured threshold and, once it's been silent long enough, opens (or times out) the
+    /// presence prompt.
+    ///
+    /// The deadline that actually has to be reached is `max(silenceDeadline,
+    /// watchdogExtendedDeadline)` — an ordinary `silenceDurationSeconds`-from-last-activity
+    /// deadline, versus a fixed `confirmExtensionSeconds`-from-the-last-"I'm here"-press
+    /// deadline (see `confirmPresence()`). Whichever is later wins: if real activity happens
+    /// and then stops again well before the extension would've elapsed, the extension (being
+    /// later) still applies; if activity happens close enough to the extension's own deadline
+    /// that a fresh 3-minute-from-then window would run past it, that fresh window wins
+    /// instead. No explicit bookkeeping is needed to make the fresh window "win" — since
+    /// `micLastAboveThresholdDate` only ever advances while there's real activity,
+    /// `silenceDeadline` only ever grows, so it naturally overtakes the fixed
+    /// `watchdogExtendedDeadline` the moment it would matter.
     private func tickWatchdog() {
         guard let currentMode else { return }
         let watchdog = currentMode.config(config).watchdog
@@ -466,13 +494,17 @@ final class AppState: ObservableObject {
         }
 
         let thresholdMul = Self.dbToLinear(watchdog.silenceThresholdDB)
-        if let level = currentMicLevel(), level >= thresholdMul {
+        if let level = maxWatchedLevel(), level >= thresholdMul {
             micLastAboveThresholdDate = now
             return
         }
 
         let lastAbove = micLastAboveThresholdDate ?? now
-        if now.timeIntervalSince(lastAbove) >= watchdog.silenceDurationSeconds {
+        let silenceDeadline = lastAbove.addingTimeInterval(watchdog.silenceDurationSeconds)
+        let effectiveDeadline = max(silenceDeadline, watchdogExtendedDeadline ?? .distantPast)
+
+        if now >= effectiveDeadline {
+            watchdogExtendedDeadline = nil
             let deadline = now.addingTimeInterval(watchdog.responseWindowSeconds)
             watchdogPromptDeadline = deadline
             watchdogNotifier.postPrompt(responseWindowSeconds: watchdog.responseWindowSeconds)
@@ -480,9 +512,13 @@ final class AppState: ObservableObject {
         }
     }
 
-    private func currentMicLevel() -> Float? {
-        guard let resolvedMicSourceName else { return nil }
-        return channelLevels.first(where: { $0.name == resolvedMicSourceName })?.peakLevel
+    /// The loudest live level among every channel the watchdog is currently treating as
+    /// "presence" (see `watchdogChannelNames`) — any one of them being active counts as not
+    /// silent, since a loud screen-share is just as much "someone's here" as their own mic.
+    private func maxWatchedLevel() -> Float? {
+        let levels = channelLevels.filter { watchdogChannelNames.contains($0.name) }
+        guard !levels.isEmpty else { return nil }
+        return levels.map(\.peakLevel).max()
     }
 
     private static func dbToLinear(_ db: Double) -> Float {
@@ -490,11 +526,17 @@ final class AppState: ObservableObject {
     }
 
     /// Confirms presence — from the inline "I'm here" button or the notification action —
-    /// resetting the silence clock and letting the recording continue normally.
+    /// resetting the silence clock and letting the recording continue normally. Also grants
+    /// `confirmExtensionSeconds` of slack from this moment (longer than the ordinary
+    /// `silenceDurationSeconds`, since a confirmed "I'm here" is stronger evidence than an
+    /// ordinary pause in talking) — see `tickWatchdog()` for how this competes with a later
+    /// burst of real activity.
     func confirmPresence() {
-        guard watchdogPromptDeadline != nil else { return }
+        guard watchdogPromptDeadline != nil, let currentMode else { return }
         clearWatchdogPrompt()
-        micLastAboveThresholdDate = Date()
+        let now = Date()
+        micLastAboveThresholdDate = now
+        watchdogExtendedDeadline = now.addingTimeInterval(currentMode.config(config).watchdog.confirmExtensionSeconds)
     }
 
     private func clearWatchdogPrompt() {
@@ -580,6 +622,7 @@ final class AppState: ObservableObject {
         currentMode = nil
         resolvedMicDescription = nil
         resolvedMicSourceName = nil
+        watchdogChannelNames = []
         recordStartDate = nil
         pauseStartDate = nil
         pausedAccumulated = 0
@@ -588,6 +631,7 @@ final class AppState: ObservableObject {
         stopElapsedTimer()
         clearWatchdogPrompt()
         micLastAboveThresholdDate = nil
+        watchdogExtendedDeadline = nil
         idleTransitionTask = Task { [weak self] in await self?.goIdleInOBS() }
     }
 

@@ -228,15 +228,64 @@ start), and a mode's `watchdog.enabled == false`. Resuming from pause resets
 `micLastAboveThresholdDate` to now rather than counting the pause itself as silence.
 
 Per-mode config lives in each `ModeConfig.watchdog` (`WatchdogConfig`: `enabled`,
-`silenceThresholdDB`, `silenceDurationSeconds`, `responseWindowSeconds`) rather than a single
-global block, specifically because Guide mode's default differs from Sales Call/Other Call's
-(see `RecBarConfig.default` in `Config.swift`) — Guide is narrated on-screen with long
-stretches of intentional on-mic silence, so it defaults to **off**, while Sales/Other default
-to **on** (-50dB / 30s / 60s). `RecBarConfig.decodeModeConfig(_:forKey:defaultWatchdog:)`
-exists specifically so each mode can fall back to its own default when loading an older
-`config.json` that predates this field — a bug during initial rollout (fixed same day) had
-this fall through `ModeConfig`'s own `Decodable init` instead, which has no way to know which
-mode it's decoding and so defaulted every mode to "on" including Guide.
+`silenceThresholdDB`, `silenceDurationSeconds`, `responseWindowSeconds`,
+`confirmExtensionSeconds`) rather than a single global block, specifically because Guide
+mode's default differs from Sales Call/Other Call's (see `RecBarConfig.default` in
+`Config.swift`) — Guide is narrated on-screen with long stretches of intentional on-mic
+silence, so it defaults to **off**, while Sales/Other default to **on** (-35dB / 180s / 60s /
+420s). `RecBarConfig.decodeModeConfig(_:forKey:defaultWatchdog:)` exists specifically so each
+mode can fall back to its own default when loading an older `config.json` that predates this
+field — a bug during initial rollout (fixed same day) had this fall through `ModeConfig`'s own
+`Decodable init` instead, which has no way to know which mode it's decoding and so defaulted
+every mode to "on" including Guide.
+
+**Confirm-extension deadline and all-channel monitoring (2026-08-28, explicit user request).**
+Two changes to the trigger condition, on top of the existing threshold/duration mechanics
+above:
+
+- `silenceDurationSeconds` default raised from 30s to **3 minutes (180s)**, and a new
+  `confirmExtensionSeconds` field (default **7 minutes / 420s**) added: pressing "I'm here"
+  now buys `confirmExtensionSeconds` of slack *from the moment of the press*, not just the
+  ordinary `silenceDurationSeconds` from last activity — a confirmed "I'm here" is stronger
+  evidence of presence than an ordinary pause in talking, so it earns more headroom.
+  `AppState.confirmPresence()` sets `watchdogExtendedDeadline = now +
+  confirmExtensionSeconds` alongside its existing `micLastAboveThresholdDate` reset.
+  `tickWatchdog()` compares two candidate deadlines each tick — the ordinary
+  `micLastAboveThresholdDate + silenceDurationSeconds`, and `watchdogExtendedDeadline` (if
+  set) — and only actually opens the prompt once **the later of the two** is reached, per this
+  user-specified example: press "I'm here" at t=0 (extension deadline t=7min); if real speech
+  happens at t=5min and then goes silent again at t=6min, the ordinary deadline recomputes to
+  6+3=9min, which is later than the t=7min extension, so *that* wins and the prompt doesn't
+  fire until t=9min — not t=7min, and not a naive t=6+3 ignoring the extension either, since
+  9 > 7 either way in this example; but if speech happens right after the press and stops
+  again almost immediately, the ordinary deadline would recompute to only ~t=3min, which is
+  *earlier* than the still-active t=7min extension, so the extension wins instead and the
+  prompt fires at t=7min, not t=3min. No extra bookkeeping is needed to make the ordinary
+  deadline "win" once it's actually later — `micLastAboveThresholdDate` only advances during
+  real activity, so the ordinary deadline it produces only ever grows, meaning it naturally
+  overtakes the fixed extension deadline exactly when it should. The extension is cleared
+  (`watchdogExtendedDeadline = nil`) the moment either deadline is actually reached and the
+  prompt opens, so a stale extension never lingers into the *next* silence cycle.
+- The watchdog now monitors **every currently-active audio channel**, not just the resolved
+  mic — `AppState.watchdogChannelNames` (resolved mic + `desktopAudioSourceName` for
+  Sales/Other Call, resolved mic only for Guide since it never has desktop audio live) is set
+  in `beginRecording` and read by `tickWatchdog()`'s `maxWatchedLevel()`, which takes the max
+  peak across every channel in that set — any one of them being active counts as "someone's
+  here," since a loud screen-share is just as much presence as the presenter's own mic.
+  Deliberately excludes the *other*, currently-muted mic source (e.g. built-in mic while a USB
+  mic is resolved): a muted source can still pick up ambient room noise that contributes
+  nothing to the actual recording, which would mask real silence on the channels that matter
+  if it were included. The debug drawer's "(watched)" label and red-below-threshold
+  highlighting in `RecordingView.swift` now key off membership in `watchdogChannelNames`
+  rather than equality with a single `resolvedMicSourceName`.
+
+Not yet verified end-to-end with real silence (unlike the original watchdog flow, confirmed
+2026-08-28 before this change) — the "later deadline wins" logic and multi-channel monitoring
+have only been verified by reading the code and by a successful `./build.sh` compile; still
+needs a real walkthrough (silence → prompt at ~3min, confirm, speak then re-silence at various
+offsets to check both branches of the later-wins comparison, and confirm desktop audio alone
+staying loud during Sales/Other Call prevents the prompt from firing even with the mic dead
+silent).
 
 ## Idle resource minimization
 
