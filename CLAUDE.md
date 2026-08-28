@@ -287,6 +287,47 @@ offsets to check both branches of the later-wins comparison, and confirm desktop
 staying loud during Sales/Other Call prevents the prompt from firing even with the mic dead
 silent).
 
+**Live on/off toggle in the debug drawer (2026-08-28, explicit user request).** The debug
+drawer (expand via the ellipsis button in `RecordingView`) now has a `Toggle` at the top,
+labeled with the literal `dog.fill` SF Symbol per the user's request, bound to
+`AppState.watchdogEnabled` via `toggleWatchdogEnabled()`. This is a **session-local override
+only** — `watchdogEnabled` is seeded from `modeConfig.watchdog.enabled` in `beginRecording`
+and reset to `false` in `resetToIdle`, but toggling it never writes to config.json, so the
+mode's own configured default (Guide off, Sales/Other on) is unaffected for the *next*
+recording. Deliberately no UI for threshold/duration/extension — only on/off, per explicit
+request ("I don't want to be able to adjust timing"); those still only come from config.json.
+`tickWatchdog()` gates on `watchdogEnabled` (not `watchdog.enabled` from config directly) but
+still reads every other field (`silenceThresholdDB`, `silenceDurationSeconds`,
+`responseWindowSeconds`, `confirmExtensionSeconds`) from the mode's config as before. Turning
+it off while a prompt is already in flight immediately clears it (`toggleWatchdogEnabled`
+calls `clearWatchdogPrompt()` + drops `watchdogExtendedDeadline`) rather than letting it
+resolve into an auto-stop for a watchdog the user just disabled.
+
+**Debug drawer ellipsis unresponsive during active recording, and couldn't be collapsed once
+opened — root cause confirmed, not a timing/race issue (2026-08-28).** User report: pressing
+the ellipsis (⋯) button to expand the debug drawer did nothing while actively recording, only
+worked once paused, and even then a second press wouldn't collapse it again. Root cause:
+`RecBarApp.swift`'s `PopoverContent` had `.onAppear { appState.debugDrawerExpanded = false }`
+attached to the `Group` wrapping the `SelectionView`/`RecordingView` switch, intended (per its
+own comment) to reset the drawer only when the *popover itself* was freshly reopened. In
+practice `.onAppear` on that conditional content re-fired on effectively every AppState-driven
+re-render — most consequentially the once-a-second `elapsed` tick (`tickElapsed`/
+`tickWatchdog`, which only run while `recordingState == .recording`, never while `.paused` —
+exactly matching why the bug was paused-only-workable) — forcibly resetting
+`debugDrawerExpanded` back to `false` within roughly a second of any toggle, so the drawer
+could never stay open long enough to register as "opened" while actively recording, and even
+while paused (where the churn is far less frequent, from meter events, but not zero) a second
+press to collapse would just as easily race a spurious auto-reset that had already happened
+moments earlier. Fixed by deleting the `.onAppear` reset entirely and moving the collapse to
+`AppState.resetToIdle()` (`debugDrawerExpanded = false` alongside the other end-of-recording
+resets) — a real, one-time state transition (a recording actually ending) rather than a
+render-frequency-dependent hook, so each new recording still starts with the drawer collapsed
+without anything fighting the user's own toggle while one is in progress. Verified only by
+reading the code and a clean `./build.sh` compile — not yet walked through live (see
+`CLAUDE.md`'s "Testing notes" for why: no GUI automation for native macOS apps in this
+environment); worth confirming the ellipsis now toggles freely in both directions while
+actively recording, not just while paused.
+
 ## Idle resource minimization
 
 Since RecBar never quits OBS (see "OBS auto-launch/quit" above), a hidden-but-running OBS

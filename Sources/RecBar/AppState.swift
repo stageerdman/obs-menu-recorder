@@ -59,6 +59,12 @@ final class AppState: ObservableObject {
     /// Non-nil while the silence watchdog is waiting on a presence confirmation; the popover
     /// shows a countdown to this deadline, after which the recording auto-stops.
     @Published private(set) var watchdogPromptDeadline: Date?
+    /// Live on/off override for the current recording session only — initialized from the
+    /// mode's own configured default (`ModeConfig.watchdog.enabled`) when a recording starts,
+    /// toggleable from the debug drawer's dog icon, and never written back to config.json, so
+    /// the mode's configured default is unaffected for next time. Thresholds/durations stay
+    /// config-only by design — the UI only exposes on/off.
+    @Published private(set) var watchdogEnabled = false
 
     /// Not `let`: each `*Release` config's `lastKnown*` fields get updated (and persisted) in
     /// place every time `releaseInput(at:)` snapshots that source before removing it.
@@ -237,6 +243,7 @@ final class AppState: ObservableObject {
         if mode != .guide {
             watchdogChannelNames.insert(config.sources.desktopAudioSourceName)
         }
+        watchdogEnabled = modeConfig.watchdog.enabled
         recordStartDate = Date()
         pausedAccumulated = 0
         pauseStartDate = nil
@@ -471,11 +478,11 @@ final class AppState: ObservableObject {
     /// `watchdogExtendedDeadline` the moment it would matter.
     private func tickWatchdog() {
         guard let currentMode else { return }
-        let watchdog = currentMode.config(config).watchdog
-        guard watchdog.enabled else {
+        guard watchdogEnabled else {
             if watchdogPromptDeadline != nil { clearWatchdogPrompt() }
             return
         }
+        let watchdog = currentMode.config(config).watchdog
 
         let now = Date()
 
@@ -523,6 +530,18 @@ final class AppState: ObservableObject {
 
     private static func dbToLinear(_ db: Double) -> Float {
         Float(pow(10.0, db / 20.0))
+    }
+
+    /// Flips the session-local watchdog override — see `watchdogEnabled`'s doc comment for why
+    /// this never touches config.json. Turning it off immediately drops any in-flight prompt
+    /// rather than leaving it to resolve into an auto-stop for a watchdog the user just disabled.
+    func toggleWatchdogEnabled() {
+        guard recordingState != .idle else { return }
+        watchdogEnabled.toggle()
+        if !watchdogEnabled {
+            clearWatchdogPrompt()
+            watchdogExtendedDeadline = nil
+        }
     }
 
     /// Confirms presence — from the inline "I'm here" button or the notification action —
@@ -623,11 +642,17 @@ final class AppState: ObservableObject {
         resolvedMicDescription = nil
         resolvedMicSourceName = nil
         watchdogChannelNames = []
+        watchdogEnabled = false
         recordStartDate = nil
         pauseStartDate = nil
         pausedAccumulated = 0
         elapsed = 0
         channelLevels = []
+        // Each new recording starts with the drawer collapsed — deliberately reset here
+        // (a genuine state transition) rather than via .onAppear on the popover's content view,
+        // which used to refire on every AppState-driven re-render (e.g. the once-a-second
+        // elapsed tick) and force the drawer shut mid-interaction — see RecBarApp.swift history.
+        debugDrawerExpanded = false
         stopElapsedTimer()
         clearWatchdogPrompt()
         micLastAboveThresholdDate = nil

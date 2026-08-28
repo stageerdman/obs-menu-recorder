@@ -139,6 +139,16 @@ private struct DebugDrawer: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
+            Toggle(isOn: Binding(
+                get: { appState.watchdogEnabled },
+                set: { _ in appState.toggleWatchdogEnabled() }
+            )) {
+                Label("Silence watchdog", systemImage: "dog.fill")
+                    .font(.caption2)
+            }
+            .toggleStyle(.switch)
+            .controlSize(.small)
+
             HStack(spacing: 6) {
                 Circle()
                     .fill(appState.connectionState == .connected ? Color.green : RecBarColor.red)
@@ -154,7 +164,7 @@ private struct DebugDrawer: View {
                     .foregroundStyle(.secondary)
             }
 
-            if let thresholdDB {
+            if appState.watchdogEnabled, let thresholdDB {
                 Text("Watchdog threshold: \(Int(thresholdDB)) dB")
                     .font(.caption2)
                     .foregroundStyle(.secondary)

@@ -24,16 +24,12 @@ private struct PopoverContent: View {
     @EnvironmentObject var appState: AppState
 
     var body: some View {
-        Group {
-            switch appState.recordingState {
-            case .idle:
-                SelectionView()
-            case .recording, .paused:
-                RecordingView()
-            }
+        switch appState.recordingState {
+        case .idle:
+            SelectionView()
+        case .recording, .paused:
+            RecordingView()
         }
-        // Reopening the popover always starts with the drawer collapsed.
-        .onAppear { appState.debugDrawerExpanded = false }
     }
 }
 
