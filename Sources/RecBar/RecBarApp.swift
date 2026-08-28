@@ -57,7 +57,8 @@ private struct MenuBarIcon: View {
         if appState.watchdogPromptDeadline != nil { return .orange }
         switch appState.recordingState {
         case .idle: return .primary
-        case .recording, .paused: return RecBarColor.red
+        case .recording: return RecBarColor.green
+        case .paused: return RecBarColor.red
         }
     }
 }

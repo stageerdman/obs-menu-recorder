@@ -52,8 +52,12 @@ time + an expandable live-audio-level debug drawer while recording.
   "I'm here" `UNNotificationAction`; either that action or tapping the notification body
   counts as a presence confirmation (`onConfirm` closure, wired to `AppState.confirmPresence()`).
 - Menu bar / mode icons are SF Symbols rendered directly (no bundled image assets needed) —
-  they pick up template/dark-light behavior for free, and the recording/paused states are
-  explicitly tinted red via `RecBarColor.red` (`Theme.swift`) regardless of appearance.
+  they pick up template/dark-light behavior for free, and are explicitly tinted rather than
+  left to the system's default template rendering, regardless of appearance: actively
+  recording is `RecBarColor.green` (Apple's system green, #34C759 — 2026-08-28, explicit user
+  request for a "shining green" recording indicator), paused is `RecBarColor.red`, and an
+  in-flight watchdog prompt overrides both to orange (see `MenuBarIcon.tint` in
+  `RecBarApp.swift`; `RecBarColor` lives in `Theme.swift`).
 
 ## obs-websocket requests actually used
 
