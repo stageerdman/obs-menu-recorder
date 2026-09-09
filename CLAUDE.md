@@ -226,45 +226,52 @@ fixes:
   session bug itself — there's still no known websocket-reachable fix for that, per the
   existing "Camera stuck open" investigation; this only stops the *symptom* of a stuck item
   silently keeping stale settings forever.)
-- **Audio mode's `.mov`-only result**: root cause not fully confirmed (a hand-run reproduction
-  of the exact `ffmpeg`/`Process` invocation against a real saved file worked perfectly, exit
-  0, mp3 produced — see below), but the leading theory is simply *timing*: the old code
-  transcoded in place, so the real Audio folder showed the `.mov` for however long the
-  transcode took (extraction runs at roughly 230x realtime per the reproduction, so a ~90-
-  minute call is still a real ~25 seconds) — checking Finder/the Library window shortly after
-  stopping would see exactly the reported symptom (a `.mov`, no `.mp3` yet), not a real
-  failure. Fixed two ways regardless of which explanation is right: (1) **staging folder** —
-  Audio mode now records into a temp directory (`AppState.audioStagingDirectory()`, under
-  `FileManager.default.temporaryDirectory`) instead of its real save folder at all, so the
-  real Audio folder shows *nothing* until the finished mp3 (or, on failure, the moved-back
-  `.mov`) actually lands there — never a transient in-progress `.mov` to be mistaken for a
-  failure. `transcodeToMP3ThenRegister` now takes the staging path and the real destination
-  folder separately, reads from staging, writes the mp3 straight into the real folder, and
-  deletes the staging `.mov` once the mp3 exists (or moves it into the real folder as the
-  fallback if ffmpeg fails). (2) **stderr is no longer discarded** — the original version
-  redirected both `stdout`/`stderr` to `/dev/null`, so any real ffmpeg failure would have been
-  completely silent and undiagnosable (matching the reported symptom exactly if it *was* a
-  real failure). Now captured via a `Pipe`, read via `readDataToEndOfFile()` **before**
-  `waitUntilExit()` (the correct order — reading first avoids a classic Process+Pipe deadlock
-  if the child ever writes enough output to fill the pipe before exiting) and logged via
-  `NSLog` on any non-zero exit. Also added `-map 0:a:0` to the ffmpeg arguments to explicitly
-  select track 1 (the full mix — see `applyAudioTrackRouting` above) now that the source file
-  has multiple audio streams, rather than trusting ffmpeg's default stream-selection heuristic.
-  Reproduction command used to confirm the base ffmpeg command itself works correctly against
-  a real saved file: `ffmpeg -y -i input.mov -vn -acodec libmp3lame -q:a 2 output.mp3` — exit
-  0, valid mp3 produced, confirming the command syntax was never the problem.
+- **Audio mode's `.mov`-only result, root cause confirmed (2026-09-09): a race in
+  `stop(discard:)` itself, unrelated to ffmpeg — affected every mode's registration, not just
+  Audio's transcode.** A hand-run reproduction of the exact `ffmpeg`/`Process` invocation
+  against a real saved file worked perfectly (exit 0, valid mp3 — command used:
+  `ffmpeg -y -i input.mov -vn -acodec libmp3lame -q:a 2 output.mp3`), and file-based tracing
+  (`log show`/NSLog output wasn't showing up for this ad-hoc-signed process at all, so a
+  temporary plain-file trace was added and then removed once this was confirmed) showed the
+  transcode function was never even being *entered* — the registration branch in
+  `stop(discard:)` was being skipped entirely. Root cause: `stop(discard:)` reads
+  `currentMode` *after* `await waitForEvent("RecordStateChanged", ...)` — but that same
+  `RecordStateChanged`/`STOPPED` event is also handled by `handleRecordStateChanged`, which
+  calls `resetToIdle()` (nil-ing `currentMode`) **synchronously**, as part of the very same
+  event dispatch that resumes `stop()`'s suspended continuation. That reset could win the
+  race and complete before `stop()`'s own continuation resumed, so `let mode = currentMode`
+  after the await could already see `nil`, silently skipping the entire
+  registration/transcode branch — exactly matching a real recording finishing and being
+  staged correctly (confirmed: real files were landing in the temp staging folder) but never
+  getting processed into an mp3. Fixed by capturing `let mode = currentMode` **before** the
+  function's first `await`, at the very top of `stop(discard:)`, so it reflects whatever was
+  actually recording when stop was invoked regardless of anything `resetToIdle()` does to
+  `self.currentMode` afterward. This bug predates this session's changes and could in theory
+  have affected Meetings/Guide registration too on unlucky timing, not just Audio's transcode
+  — Audio mode's extra processing step just made the failure visible and reproducible. Two
+  recordings stranded in the temp staging folder by the pre-fix builds were manually
+  recovered (converted to mp3 by hand, moved into the real Audio folder) rather than lost.
+  **Confirmed fixed by the user with a real Audio-mode recording (2026-09-09)**: mp3 appeared
+  correctly, no leftover `.mov`.
+  - Separately, real ffmpeg-invocation issues found and fixed while investigating (still
+    correct/worth keeping regardless of the race above): **staging folder** — Audio mode
+    records into a temp directory (`AppState.audioStagingDirectory()`, under
+    `FileManager.default.temporaryDirectory`) instead of its real save folder, so the real
+    Audio folder only ever shows the finished mp3 (or, on failure, the moved-back `.mov`),
+    never a transient in-progress file. **stderr is no longer discarded** — the original
+    version redirected both `stdout`/`stderr` to `/dev/null`; now captured via a `Pipe`, read
+    via `readDataToEndOfFile()` **before** `waitUntilExit()` (reading first avoids a classic
+    Process+Pipe deadlock if the child writes enough to fill the pipe before exiting), and
+    logged via `NSLog` on any non-zero exit. **`-map 0:a:0`** added to explicitly select track
+    1 (the full mix) now that the source file has multiple audio streams.
 
-- **Not yet verified end-to-end** (no GUI automation, no way to visually confirm OBS scene
-  composition in this environment — see "Testing notes"): the three fixes above passed a
-  clean build/launch/quit smoke test but haven't been exercised with a real recording yet.
-  Still open from the original build: whether the camera PiP looks right (correct corner, no
-  black bars, face actually visible/centered — `boundsAlignment: 0` assumes the webcam
-  roughly centers the user), that Screen/Desktop Sounds actually appear correctly in `Guide
-  Recording Setup` on first use (the code path recreates them from an existing global
-  snapshot that's never been restored into that specific scene before), that the three audio
-  tracks actually contain
-  what they're supposed to (mix/mic-only/desktop-only) in a real saved file, or that an Audio
-  mode recording actually ends up as mp3-only with no leftover `.mov`.
+- **Confirmed working end-to-end by the user (2026-09-09)**: camera renders on top and stays
+  enabled in Guide, and an Audio-mode recording correctly ends up as mp3-only with the `.mov`
+  gone. **Still not specifically re-confirmed**: whether the camera PiP's exact crop/corner
+  looks visually right (functionally on top and enabled, per the above, but framing/size
+  wasn't separately called out), and whether the three audio tracks actually contain what
+  they're supposed to (mix/mic-only/desktop-only) — worth a quick `ffmpeg -i file.mov` stream
+  check next time either area is touched.
 
 ## Microphone priority rule
 
@@ -770,19 +777,16 @@ changes into one commit.
 
 - **Meetings/Audio/Guide rename + restructure (2026-09-09)**: build/install/launch/quit
   confirmed clean, folder rename verified (identical file counts before/after, every
-  `library.json` entry's rewritten path confirmed to still resolve to a real file). **First
-  real Guide/Audio recording surfaced 3 bugs** (camera hidden behind screen + sometimes off,
-  Audio mode leaving only a `.mov`) — see the "Follow-up from the first real test" entry
-  under "Recording modes" above for the fixes. Those fixes themselves are **not yet
-  re-verified with another real recording** — still needs, per mode: **Guide** — does the
-  camera now render on top and stay enabled, does the PiP look right (corner, crop, no black
-  bars); **all three modes** — inspect a saved file's tracks (e.g. `ffmpeg -i file.mov` lists
-  stream info per track) to confirm track 1 has everything, track 2 is mic-only, track 3 is
-  desktop-only; **Audio** — confirm the finished recording is mp3-only with the `.mov`
-  actually gone from both the temp staging folder and the real Audio folder, and that the
-  Library window shows the mp3 (not a phantom `.mov` entry). If Audio mode fails again, check
-  Console.app for `NSLog` output starting "RecBar: ffmpeg" — failures now log ffmpeg's actual
-  stderr instead of discarding it.
+  `library.json` entry's rewritten path confirmed to still resolve to a real file). First
+  real Guide/Audio recording surfaced 3 bugs (camera hidden behind screen + sometimes off,
+  Audio mode leaving only a `.mov`) — see "Recording modes" above for the fixes, including
+  the real root cause of the Audio bug (a `currentMode`-nil'd-before-read race in
+  `stop(discard:)`, not an ffmpeg problem). **Confirmed fixed by the user with real
+  recordings (2026-09-09)**: camera renders on top and stays enabled in Guide; Audio mode
+  correctly produces an mp3 with no leftover `.mov`. Still not specifically re-confirmed:
+  camera PiP framing/crop quality, and whether the three audio tracks actually split as
+  intended (inspect a saved file with `ffmpeg -i file.mov` to check per-track content) — worth
+  a quick look next time either area is touched, but not blocking.
 
 Confirmed end-to-end with real hardware (2026-08-21): built, installed to
 `/Applications/RecBar.app`, launched (menu bar icon appears, no Dock icon), connected to a

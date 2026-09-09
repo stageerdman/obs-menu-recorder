@@ -694,6 +694,16 @@ final class AppState: ObservableObject {
     func stop(discard: Bool) {
         guard !isBusy, recordingState != .idle else { return }
         isBusy = true
+        // Captured *before* any `await` below, not re-read afterward: the `RecordStateChanged`
+        // /STOPPED event this function itself awaits (via waitForEvent) is handled by
+        // `handleRecordStateChanged`, which calls `resetToIdle()` (nil-ing `currentMode`)
+        // synchronously as part of the very same event dispatch that resumes this function's
+        // suspended continuation — so reading `self.currentMode` after the await raced against
+        // that reset and could already see `nil`, silently skipping registration entirely
+        // (confirmed real-usage bug, 2026-09-09: Audio mode recordings were finishing and
+        // being staged correctly, but the transcode/registration branch below was never even
+        // entered because `mode` had already gone nil by the time it ran).
+        let mode = currentMode
         Task {
             defer { isBusy = false }
             do {
@@ -707,7 +717,7 @@ final class AppState: ObservableObject {
                     } catch {
                         NSLog("RecBar: failed to delete discarded recording at \(outputPath): \(error)")
                     }
-                } else if let outputPath, let mode = currentMode {
+                } else if let outputPath, let mode {
                     if mode == .other {
                         // Audio mode ("Audio", .other) keeps only the sound — outputPath is
                         // the *staging* copy (see beginRecording's audioStagingDirectory());
