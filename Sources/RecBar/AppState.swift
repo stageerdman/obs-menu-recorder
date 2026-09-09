@@ -1,7 +1,7 @@
 import Foundation
 import Combine
 
-enum RecordingMode: String, CaseIterable, Identifiable {
+enum RecordingMode: String, CaseIterable, Identifiable, Codable {
     case sales
     case guide
     case other
@@ -645,6 +645,12 @@ final class AppState: ObservableObject {
                     } catch {
                         NSLog("RecBar: failed to delete discarded recording at \(outputPath): \(error)")
                     }
+                } else if let outputPath, let mode = currentMode {
+                    // Registered here (before resetToIdle nils currentMode) rather than
+                    // waiting for the Library window's own folder scan, so a kept recording
+                    // is tracked the instant it exists — see LibraryStore.reconcile for the
+                    // separate pass that also picks up pre-existing/untracked files.
+                    LibraryStore.registerCompletedRecording(path: outputPath, mode: mode)
                 }
 
                 resetToIdle()

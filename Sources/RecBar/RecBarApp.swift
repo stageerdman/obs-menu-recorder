@@ -17,19 +17,45 @@ struct RecBarApp: App {
                 .environmentObject(appState)
         }
         .menuBarExtraStyle(.window)
+
+        // A single-instance window (not WindowGroup, which would spawn a new instance on
+        // every openWindow(id:) call with no built-in dedup) listing every tracked recording
+        // across the 3 save folders — see LibraryView. Requires macOS 14 (Package.swift was
+        // bumped from .v13 for this Scene type specifically).
+        Window("Library", id: "library") {
+            LibraryView(appState: appState)
+        }
     }
 }
 
 private struct PopoverContent: View {
     @EnvironmentObject var appState: AppState
+    @Environment(\.openWindow) private var openWindow
 
     var body: some View {
-        switch appState.recordingState {
-        case .idle:
-            SelectionView()
-        case .recording, .paused:
-            RecordingView()
+        VStack(spacing: 0) {
+            HStack {
+                Spacer()
+                Button {
+                    openWindow(id: "library")
+                } label: {
+                    Image(systemName: "rectangle.stack")
+                        .font(.system(size: 12, weight: .semibold))
+                }
+                .buttonStyle(.plain)
+                .help("Open Library")
+            }
+            .padding(.horizontal, 10)
+            .padding(.top, 8)
+
+            switch appState.recordingState {
+            case .idle:
+                SelectionView()
+            case .recording, .paused:
+                RecordingView()
+            }
         }
+        .frame(maxWidth: .infinity)
     }
 }
 
