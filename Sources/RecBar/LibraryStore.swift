@@ -75,7 +75,9 @@ struct RecordingMetadata: Codable, Identifiable {
 /// `ConfigStore`'s load/save shape exactly (same directory, same atomic write via
 /// `[.prettyPrinted, .sortedKeys]`).
 enum LibraryStore {
-    private static let videoExtensions: Set<String> = ["mov", "mp4", "m4v", "mkv", "avi"]
+    // "mp3" covers Audio mode's output (AppState.transcodeToMP3ThenRegister deletes the
+    // original .mov, keeping only the mp3 — see CLAUDE.md).
+    private static let mediaExtensions: Set<String> = ["mov", "mp4", "m4v", "mkv", "avi", "mp3"]
 
     static var libraryURL: URL {
         ConfigStore.configDirectory.appendingPathComponent("library.json")
@@ -132,7 +134,7 @@ enum LibraryStore {
             let folder = mode.config(config).saveFolder
             guard let entries = try? FileManager.default.contentsOfDirectory(atPath: folder) else { continue }
             for name in entries {
-                guard videoExtensions.contains((name as NSString).pathExtension.lowercased()) else { continue }
+                guard mediaExtensions.contains((name as NSString).pathExtension.lowercased()) else { continue }
                 let path = (folder as NSString).appendingPathComponent(name)
                 guard !knownPaths.contains(path) else { continue }
                 let attrs = try? FileManager.default.attributesOfItem(atPath: path)

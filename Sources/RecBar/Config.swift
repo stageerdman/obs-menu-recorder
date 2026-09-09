@@ -176,8 +176,13 @@ struct RecBarConfig: Codable {
     /// AppState.goIdleInOBS()). Auto-created via CreateScene if it doesn't already exist.
     var idleSceneName: String
     var cameraRelease: ReleasableInputConfig
-    /// Screen capture and desktop audio are only used by Sales Call/Other Call (both share
-    /// `Meet Recording Setup`) — Guide mode never touches either.
+    /// Screen capture and desktop audio used to be Meetings/Audio-only (both share `Meet
+    /// Recording Setup`) but as of 2026-09-09 Guide also records the screen (with a small
+    /// camera-square PiP over it) and desktop audio — see "Guide gets a screen recording +
+    /// camera PiP" in CLAUDE.md. Restored into whichever real scene is current via
+    /// `restoreInput`'s `sceneNameOverride`, the same shared-global-input pattern already used
+    /// for the mic sources below, since it's one shared OBS input regardless of which scene
+    /// currently displays it.
     var screenRelease: ReleasableInputConfig
     var desktopAudioRelease: ReleasableInputConfig
     /// Unlike camera/screen/desktop-audio (each only ever live in one scene), the built-in
@@ -210,9 +215,13 @@ struct RecBarConfig: Codable {
             micWiredSourceName: "Headphones Mic",
             desktopAudioSourceName: "Desktop Sounds"
         ),
+        // Internal case/property names (salesMode/otherMode, RecordingMode.sales/.other) were
+        // kept as-is when these modes were renamed to "Meetings"/"Audio" (2026-09-09) — only
+        // `.title`/`.symbolName` changed — specifically so already-saved library.json entries
+        // (which persist RecordingMode's raw value) keep decoding without any migration code.
         salesMode: ModeConfig(
             sceneName: "Meet Recording Setup",
-            saveFolder: "/Users/stage/Documents/Recordings/Sales Meetings",
+            saveFolder: "/Users/stage/Documents/Recordings/Meetings",
             watchdog: .defaultOn
         ),
         guideMode: ModeConfig(
@@ -225,7 +234,7 @@ struct RecBarConfig: Codable {
         ),
         otherMode: ModeConfig(
             sceneName: "Meet Recording Setup",
-            saveFolder: "/Users/stage/Documents/Recordings/Other Meetings",
+            saveFolder: "/Users/stage/Documents/Recordings/Audio",
             watchdog: .defaultOn
         ),
         idleSceneName: "RecBar Idle",

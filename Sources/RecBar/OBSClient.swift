@@ -263,6 +263,15 @@ final class OBSClient {
         try await request("SetInputMute", data: ["inputName": inputName, "inputMuted": muted])
     }
 
+    /// Routes an input's audio onto exactly the given mixer tracks (1-6), clearing every
+    /// other track explicitly rather than leaving OBS's default (every source on every
+    /// track) in place — see `AppState.applyAudioTrackRouting`.
+    func setInputAudioTracks(inputName: String, enabledTracks: Set<Int>) async throws {
+        var tracks: [String: Bool] = [:]
+        for i in 1...6 { tracks["\(i)"] = enabledTracks.contains(i) }
+        try await request("SetInputAudioTracks", data: ["inputName": inputName, "inputAudioTracks": tracks])
+    }
+
     func startRecord() async throws {
         try await request("StartRecord")
     }
@@ -353,6 +362,31 @@ final class OBSClient {
             enabled: item["sceneItemEnabled"] as? Bool ?? true,
             transform: item["sceneItemTransform"] as? [String: Any] ?? [:]
         )
+    }
+
+    struct SceneItemSummary {
+        let sceneItemId: Int
+        let sourceName: String
+    }
+
+    /// Full item list for a scene (name + id only) — unlike `findSceneItem`, which looks up
+    /// one item by name, this is for z-order fix-ups that need every item's id relative to
+    /// the others (see `AppState.bringCameraToFront`).
+    func getSceneItemList(sceneName: String) async throws -> [SceneItemSummary] {
+        let response = try await request("GetSceneItemList", data: ["sceneName": sceneName])
+        let items = response["sceneItems"] as? [[String: Any]] ?? []
+        return items.compactMap { item in
+            guard let id = item["sceneItemId"] as? Int, let name = item["sourceName"] as? String else { return nil }
+            return SceneItemSummary(sceneItemId: id, sourceName: name)
+        }
+    }
+
+    /// Moves a scene item to a specific z-order position. Index 0 is the back of the stack
+    /// (rendered first); the highest index is the front (rendered last, i.e. on top).
+    func setSceneItemIndex(sceneName: String, sceneItemId: Int, index: Int) async throws {
+        try await request("SetSceneItemIndex", data: [
+            "sceneName": sceneName, "sceneItemId": sceneItemId, "sceneItemIndex": index
+        ])
     }
 
     func setSceneItemEnabled(sceneName: String, sceneItemId: Int, enabled: Bool) async throws {

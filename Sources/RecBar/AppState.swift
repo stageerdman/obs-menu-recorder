@@ -8,18 +8,23 @@ enum RecordingMode: String, CaseIterable, Identifiable, Codable {
 
     var id: String { rawValue }
 
+    // Renamed 2026-09-09: "Sales Call" -> "Meetings", "Other Call" -> "Audio" (Guide
+    // unchanged). Only these display strings/icons changed — the enum case names, raw
+    // values, and RecBarConfig's salesMode/otherMode properties were deliberately left alone
+    // so already-persisted library.json entries and config.json keys keep working with zero
+    // migration code (see the comment on RecBarConfig.default in Config.swift).
     var title: String {
         switch self {
-        case .sales: return "Sales Call"
+        case .sales: return "Meetings"
         case .guide: return "Guide"
-        case .other: return "Other Call"
+        case .other: return "Audio"
         }
     }
 
     var symbolName: String {
         switch self {
-        case .sales: return "dollarsign.circle.fill"
-        case .guide: return "video.fill"
+        case .sales: return "video.fill" // camera — was Guide's icon before Guide gained one of its own
+        case .guide: return "cursorarrow.click" // screen recording / mouse click
         case .other: return "mic.fill"
         }
     }
@@ -218,15 +223,32 @@ final class AppState: ObservableObject {
         try await obs.setCurrentProgramScene(modeConfig.sceneName)
         if mode == .guide {
             await restoreInput(at: \.cameraRelease)
-        } else {
-            await restoreInput(at: \.screenRelease)
-            await restoreInput(at: \.desktopAudioRelease)
         }
+        // Screen + desktop audio are shared globally across every mode now, including Guide
+        // (small camera-square PiP over a full screen recording, plus its own desktop audio —
+        // 2026-09-09) — same shared-input pattern as the mic sources just below.
+        await restoreInput(at: \.screenRelease, sceneNameOverride: modeConfig.sceneName)
+        await restoreInput(at: \.desktopAudioRelease, sceneNameOverride: modeConfig.sceneName)
         // Shared across every mode — recreated into whichever real scene is current now.
         await restoreInput(at: \.micBuiltInRelease, sceneNameOverride: modeConfig.sceneName)
         await restoreInput(at: \.micWiredRelease, sceneNameOverride: modeConfig.sceneName)
-        try await obs.setRecordDirectory(modeConfig.saveFolder)
-        try await applyMicrophonePriority(resolved, includeDesktopAudio: mode != .guide)
+        if mode == .guide {
+            // The camera must render above the screen recording, not behind it — creation
+            // order alone doesn't guarantee this (confirmed 2026-09-09 real-usage report:
+            // screen, restored after camera above, ended up drawn on top, hiding the camera
+            // square entirely). Explicitly forces the camera to the frontmost scene-item
+            // position every time, regardless of creation order.
+            await bringCameraToFront()
+        }
+        // Audio mode ("Audio", .other) records into a temp staging folder rather than
+        // straight into its real save folder — ffmpeg reads the staging copy and writes the
+        // mp3 directly into the real folder in stop(discard:)'s transcode step, so the real
+        // Audio folder never shows a transient .mov while a (possibly tens-of-seconds-long)
+        // transcode is still running. See transcodeToMP3ThenRegister.
+        let recordDirectory = mode == .other ? Self.audioStagingDirectory() : modeConfig.saveFolder
+        try await obs.setRecordDirectory(recordDirectory)
+        try await applyMicrophonePriority(resolved)
+        try await applyAudioTrackRouting(resolved)
         try await obs.startRecord()
 
         let started = await waitForEvent("RecordStateChanged", timeout: 5) { data in
@@ -252,20 +274,13 @@ final class AppState: ObservableObject {
         startElapsedTimerIfNeeded()
     }
 
-    /// Mutes every configured mic source except the one that should be active, and (for modes
-    /// that actually have it live — see `includeDesktopAudio`) keeps desktop audio unmuted.
+    /// Mutes every configured mic source except the one that should be active, and unmutes
+    /// desktop audio (unconditionally now — every mode restores `desktopAudioRelease` as of
+    /// 2026-09-09, including Guide, so there's no missing-source case to guard against
+    /// anymore; see the historical note this replaced in git history if that ever regresses).
     /// Re-writes the USB source's device_id every time, since OBS's saved device_id can go
     /// stale between physical (dis)connects.
-    ///
-    /// `includeDesktopAudio` must be `false` for Guide mode: `desktopAudioSourceName`
-    /// ("Desktop Sounds") is only ever restored in the Sales/Other Call branch of
-    /// `beginRecording` (Guide never uses it — see `config.desktopAudioRelease`), and
-    /// `goIdleInOBS` unconditionally releases it on every idle transition. So after any idle
-    /// transition following a Sales/Other Call recording, the source no longer exists at all
-    /// by the time a Guide recording starts — muting it unconditionally here failed with
-    /// "OBS request failed (600): No source was found" (confirmed 2026-08-22; Guide was the
-    /// only mode that could ever hit this, since it's the only one that skips restoring it).
-    private func applyMicrophonePriority(_ resolved: ResolvedMic, includeDesktopAudio: Bool) async throws {
+    private func applyMicrophonePriority(_ resolved: ResolvedMic) async throws {
         let sources = config.sources
 
         if resolved.role == .usb {
@@ -275,9 +290,26 @@ final class AppState: ObservableObject {
         try await obs.setInputMute(inputName: sources.micUSBSourceName, muted: resolved.role != .usb)
         try await obs.setInputMute(inputName: sources.micBuiltInSourceName, muted: resolved.role != .builtIn)
         try await obs.setInputMute(inputName: sources.micWiredSourceName, muted: true)
-        if includeDesktopAudio {
-            try await obs.setInputMute(inputName: sources.desktopAudioSourceName, muted: false)
-        }
+        try await obs.setInputMute(inputName: sources.desktopAudioSourceName, muted: false)
+    }
+
+    /// Splits the recording's audio across mixer tracks instead of OBS's default of every
+    /// source landing on every track: Track 1 = the full mix (everything), Track 2 = the
+    /// resolved mic only, Track 3 = desktop audio only. Tracks 4-6 are left unrouted
+    /// (silent). No output-format/mode change was needed for this — confirmed via
+    /// `GetProfileParameter` against the real OBS instance (2026-09-09) that
+    /// `SimpleOutput`/`RecTracks` is already `63` (all 6 tracks recorded into the file
+    /// regardless of per-source routing), so this only needed to change *which* sources feed
+    /// which tracks, not how many tracks get muxed into the output file.
+    private func applyAudioTrackRouting(_ resolved: ResolvedMic) async throws {
+        let sources = config.sources
+        let resolvedMicName = resolved.role == .usb ? sources.micUSBSourceName : sources.micBuiltInSourceName
+        let otherMicName = resolved.role == .usb ? sources.micBuiltInSourceName : sources.micUSBSourceName
+
+        try await obs.setInputAudioTracks(inputName: resolvedMicName, enabledTracks: [1, 2])
+        try await obs.setInputAudioTracks(inputName: sources.desktopAudioSourceName, enabledTracks: [1, 3])
+        try await obs.setInputAudioTracks(inputName: otherMicName, enabledTracks: [])
+        try await obs.setInputAudioTracks(inputName: sources.micWiredSourceName, enabledTracks: [])
     }
 
     // MARK: - Idle resource minimization
@@ -421,11 +453,28 @@ final class AppState: ObservableObject {
         }
         do {
             let existing = try await obs.getInputList()
-            guard !existing.contains(inputConfig.inputName) else { return }
-            guard let itemId = try await obs.createInput(
-                sceneName: sceneName, inputName: inputConfig.inputName,
-                inputKind: inputConfig.lastKnownInputKind, settings: settings
-            ) else { return }
+            let itemId: Int
+            if existing.contains(inputConfig.inputName) {
+                // Already present — most commonly because a prior release's RemoveInput
+                // silently failed to fully take effect (see "Camera stuck open after a real
+                // recording" in CLAUDE.md: RemoveInput can report success while the
+                // underlying capture session never actually tears down). Previously this
+                // just no-op'd entirely, which meant a stuck leftover item kept whatever
+                // stale enabled-state/placement it already had forever — confirmed as a
+                // real-usage contributor to the camera "sometimes off" report (2026-09-09).
+                // Falling through to re-apply enabled/transform below instead makes this
+                // self-healing on every restore, not just on first creation.
+                guard let item = try await obs.findSceneItem(sceneName: sceneName, sourceName: inputConfig.inputName) else {
+                    return // it exists, but not in this scene — nothing fixable from here
+                }
+                itemId = item.sceneItemId
+            } else {
+                guard let newItemId = try await obs.createInput(
+                    sceneName: sceneName, inputName: inputConfig.inputName,
+                    inputKind: inputConfig.lastKnownInputKind, settings: settings
+                ) else { return }
+                itemId = newItemId
+            }
             try await obs.setSceneItemEnabled(sceneName: sceneName, sceneItemId: itemId, enabled: inputConfig.lastKnownEnabled)
             if let transformData = inputConfig.lastKnownTransformJSON.data(using: .utf8),
                var transform = (try? JSONSerialization.jsonObject(with: transformData)) as? [String: Any],
@@ -442,6 +491,19 @@ final class AppState: ObservableObject {
         } catch {
             NSLog("RecBar: failed to restore \(inputConfig.inputName): \(error)")
         }
+    }
+
+    /// Forces the camera to the topmost (frontmost) scene-item position in Guide Recording
+    /// Setup, regardless of the order things were created/restored in — see the call site in
+    /// beginRecording for why this can't just be left to creation order.
+    private func bringCameraToFront() async {
+        let sceneName = config.guideMode.sceneName
+        guard let items = try? await obs.getSceneItemList(sceneName: sceneName),
+              let cameraItem = items.first(where: { $0.sourceName == config.cameraRelease.inputName }) else {
+            return
+        }
+        let frontIndex = items.count - 1
+        try? await obs.setSceneItemIndex(sceneName: sceneName, sceneItemId: cameraItem.sceneItemId, index: frontIndex)
     }
 
     /// Launches OBS hidden if it isn't running yet (no-ops, and claims no ownership, if it's
@@ -632,6 +694,16 @@ final class AppState: ObservableObject {
     func stop(discard: Bool) {
         guard !isBusy, recordingState != .idle else { return }
         isBusy = true
+        // Captured *before* any `await` below, not re-read afterward: the `RecordStateChanged`
+        // /STOPPED event this function itself awaits (via waitForEvent) is handled by
+        // `handleRecordStateChanged`, which calls `resetToIdle()` (nil-ing `currentMode`)
+        // synchronously as part of the very same event dispatch that resumes this function's
+        // suspended continuation — so reading `self.currentMode` after the await raced against
+        // that reset and could already see `nil`, silently skipping registration entirely
+        // (confirmed real-usage bug, 2026-09-09: Audio mode recordings were finishing and
+        // being staged correctly, but the transcode/registration branch below was never even
+        // entered because `mode` had already gone nil by the time it ran).
+        let mode = currentMode
         Task {
             defer { isBusy = false }
             do {
@@ -645,12 +717,24 @@ final class AppState: ObservableObject {
                     } catch {
                         NSLog("RecBar: failed to delete discarded recording at \(outputPath): \(error)")
                     }
-                } else if let outputPath, let mode = currentMode {
-                    // Registered here (before resetToIdle nils currentMode) rather than
-                    // waiting for the Library window's own folder scan, so a kept recording
-                    // is tracked the instant it exists — see LibraryStore.reconcile for the
-                    // separate pass that also picks up pre-existing/untracked files.
-                    LibraryStore.registerCompletedRecording(path: outputPath, mode: mode)
+                } else if let outputPath, let mode {
+                    if mode == .other {
+                        // Audio mode ("Audio", .other) keeps only the sound — outputPath is
+                        // the *staging* copy (see beginRecording's audioStagingDirectory());
+                        // transcodeToMP3ThenRegister extracts it to mp3 straight into the
+                        // real save folder, deletes the staging .mov, and registers whichever
+                        // file actually survives.
+                        Self.transcodeToMP3ThenRegister(
+                            stagingPath: outputPath, destinationFolder: mode.config(config).saveFolder, mode: mode
+                        )
+                    } else {
+                        // Registered here (before resetToIdle nils currentMode) rather than
+                        // waiting for the Library window's own folder scan, so a kept
+                        // recording is tracked the instant it exists — see
+                        // LibraryStore.reconcile for the separate pass that also picks up
+                        // pre-existing/untracked files.
+                        LibraryStore.registerCompletedRecording(path: outputPath, mode: mode)
+                    }
                 }
 
                 resetToIdle()
@@ -804,5 +888,95 @@ final class AppState: ObservableObject {
 
     private func simpleError(_ message: String) -> Error {
         NSError(domain: "RecBar", code: -1, userInfo: [NSLocalizedDescriptionKey: message])
+    }
+
+    // MARK: - Audio-mode transcode (mp3-only)
+
+    /// Where Audio mode actually records to — a temp staging folder, not the real save
+    /// folder — so the real Audio folder never shows a transient .mov while a (possibly
+    /// tens-of-seconds-long, for a long call) transcode is still running; only the finished
+    /// mp3 (or, on failure, the moved-back .mov) ever lands there. See
+    /// `transcodeToMP3ThenRegister`, which reads from here.
+    nonisolated private static func audioStagingDirectory() -> String {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("RecBar-Audio-Staging", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir.path
+    }
+
+    /// Extracts the audio track to mp3 via `ffmpeg` (no built-in AVFoundation export preset
+    /// produces mp3 — it isn't a licensed codec Apple bundles an encoder for), writing
+    /// straight into `destinationFolder`, then deletes the staging .mov once the mp3 exists.
+    /// `-map 0:a:0` explicitly picks the first audio stream — track 1, the full mix (see
+    /// `applyAudioTrackRouting`) — rather than trusting ffmpeg's default stream-selection
+    /// heuristic now that the file has multiple audio tracks.
+    ///
+    /// `nonisolated` and detached from AppState's MainActor deliberately: this can take a
+    /// while for a long recording and has already fully handed off from `stop()`'s own
+    /// synchronous flow by the time it runs (recordingState is already back to `.idle`), so it
+    /// has no reason to be tied to MainActor at all. Falls back to *moving* (not just
+    /// registering in place) the staging .mov into `destinationFolder` if ffmpeg is missing or
+    /// the conversion fails, so a recording is never silently lost or stranded in temp —
+    /// stderr is captured and logged on failure rather than discarded, since an earlier
+    /// version of this that discarded it produced a silent, undiagnosable failure in real use
+    /// (2026-09-09).
+    nonisolated private static func transcodeToMP3ThenRegister(stagingPath: String, destinationFolder: String, mode: RecordingMode) {
+        Task.detached(priority: .utility) {
+            let baseName = (stagingPath as NSString).lastPathComponent
+
+            func keepMovInstead() {
+                let movDestination = (destinationFolder as NSString).appendingPathComponent(baseName)
+                do {
+                    try FileManager.default.moveItem(atPath: stagingPath, toPath: movDestination)
+                    LibraryStore.registerCompletedRecording(path: movDestination, mode: mode)
+                } catch {
+                    NSLog("RecBar: failed to move staged Audio recording out of temp (\(error)) — left at \(stagingPath)")
+                }
+            }
+
+            guard let ffmpegPath = resolveFFmpegPath() else {
+                NSLog("RecBar: ffmpeg not found — keeping the .mov for this Audio recording")
+                keepMovInstead()
+                return
+            }
+
+            let mp3Name = (baseName as NSString).deletingPathExtension + ".mp3"
+            let mp3Path = (destinationFolder as NSString).appendingPathComponent(mp3Name)
+
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: ffmpegPath)
+            process.arguments = [
+                "-y", "-hide_banner", "-loglevel", "error",
+                "-i", stagingPath, "-vn", "-map", "0:a:0", "-acodec", "libmp3lame", "-q:a", "2", mp3Path
+            ]
+            process.standardOutput = FileHandle.nullDevice
+            let stderrPipe = Pipe()
+            process.standardError = stderrPipe
+
+            do {
+                try process.run()
+                // Read (and thereby drain) stderr before waitUntilExit() — reading first
+                // avoids a classic Process+Pipe deadlock if ffmpeg ever writes enough to fill
+                // the pipe buffer before exiting; readDataToEndOfFile() itself already blocks
+                // until the process closes the pipe (i.e. until it exits).
+                let stderrData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+                process.waitUntilExit()
+                guard process.terminationStatus == 0, FileManager.default.fileExists(atPath: mp3Path) else {
+                    let message = String(data: stderrData, encoding: .utf8) ?? ""
+                    NSLog("RecBar: ffmpeg transcode failed (status \(process.terminationStatus)) — keeping the .mov. ffmpeg said: \(message)")
+                    keepMovInstead()
+                    return
+                }
+                try? FileManager.default.removeItem(atPath: stagingPath)
+                LibraryStore.registerCompletedRecording(path: mp3Path, mode: mode)
+            } catch {
+                NSLog("RecBar: failed to launch ffmpeg (\(error)) — keeping the .mov")
+                keepMovInstead()
+            }
+        }
+    }
+
+    nonisolated private static func resolveFFmpegPath() -> String? {
+        ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/usr/bin/ffmpeg", "/opt/local/bin/ffmpeg"]
+            .first { FileManager.default.isExecutableFile(atPath: $0) }
     }
 }

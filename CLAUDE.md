@@ -104,8 +104,10 @@ install): `GetSceneList`, `CreateScene`, `GetInputList`, `GetInputSettings`, `Re
 ## OBS scenes & sources this app depends on
 
 Scene collection has two scenes already built by the user: `Meet Recording Setup` (used by
-both Sales Call and Other Call modes — only the save folder differs between them, so the
-save-folder-set step always runs, every mode, every time) and `Guide Recording Setup`.
+both Meetings and Audio modes — only the save folder differs between them, so the
+save-folder-set step always runs, every mode, every time) and `Guide Recording Setup`. As of
+2026-09-09 `Screen`/`Desktop Sounds` are shared globally across *all three* modes rather than
+Meet-only — see "Recording modes" below.
 
 Each scene already contains **three separate mic sources** rather than one generic "Mic"
 source with a swappable device: `Macbook` (device UID `BuiltInMicrophoneDevice`),
@@ -120,6 +122,156 @@ always stay unmuted.
 than hardcoded — the current defaults match the values above and the paths in the original
 spec, but if the user renames a scene or source in OBS, or adds a config with different
 paths, edit that file (it's gitignored, never committed).
+
+## Recording modes: Meetings / Audio / Guide (renamed + restructured 2026-09-09)
+
+The three modes were renamed and Guide's scene composition + all three modes' audio-track
+layout changed together, on explicit user request:
+
+- **Renamed, display-only**: `RecordingMode.sales` now shows as **"Meetings"**, `.other` as
+  **"Audio"** (`.guide` unchanged). Deliberately **only** `.title`/`.symbolName` changed —
+  the Swift enum case names/raw values (`sales`/`guide`/`other`) and `RecBarConfig`'s
+  `salesMode`/`otherMode` property and JSON key names were all left exactly as they were, so
+  already-persisted `library.json` entries (which store `RecordingMode`'s raw value as
+  `category`) and `config.json`'s existing keys keep working with **zero migration code** —
+  see the comment on `RecordingMode.title` in `AppState.swift` and on `RecBarConfig.default`
+  in `Config.swift`. Icons: Meetings got the camera icon Guide used to have
+  (`video.fill`), Audio kept its existing microphone icon (`mic.fill`, unchanged), Guide got
+  a new screen/click icon (`cursorarrow.click`).
+- **Save folders physically renamed on disk** (explicit user choice over just relabeling):
+  `~/Documents/Recordings/Sales Meetings` → `Meetings`, `Other Meetings` → `Audio` (`mv`, not
+  copy — verified identical file counts before/after). `config.json`'s
+  `salesMode.saveFolder`/`otherMode.saveFolder` and `RecBarConfig.default`'s hardcoded paths
+  in `Config.swift` were updated to match, and every existing `library.json` entry's
+  `lastKnownLocalPath` was rewritten to the new paths (a plain string replace, verified
+  afterward that every entry's path still resolves to a real file) — done this way, by hand,
+  specifically to avoid losing any already-uploaded OneDrive link's association with its local
+  file, which a naive "let the next reconcile pass rediscover everything" approach would have
+  orphaned (a moved-then-rediscovered file would look "brand new" with no memory of its
+  existing cloud state).
+- **Guide gets a screen recording + camera PiP + desktop audio — previously it was
+  camera-only, full-frame, no screen or desktop audio at all.** `AppState.beginRecording` no
+  longer branches `screenRelease`/`desktopAudioRelease` restoration on `mode != .guide` — both
+  are now restored into whichever scene is current (`sceneNameOverride: modeConfig.sceneName`)
+  for **every** mode, the same shared-global-input pattern already used for the mic sources
+  (see `RecBarConfig.screenRelease`'s updated doc comment). `cameraRelease` is still
+  Guide-only. Since `Screen`/`Desktop Sounds` are single shared OBS inputs (not per-scene),
+  reusing whatever transform was already snapshotted from `Meet Recording Setup` (full-frame)
+  naturally produces the same full-frame placement in `Guide Recording Setup` too — no new
+  transform needed for either. The camera *did* need a new transform: Guide's `cameraRelease`
+  was previously full-frame (`scaleX`/`scaleY`: 1, `boundsType`: `OBS_BOUNDS_NONE`) from when
+  Guide was camera-only; hand-edited directly in `config.json`'s
+  `cameraRelease.lastKnownTransformJSON` to a bottom-right square PiP:
+  `boundsType: OBS_BOUNDS_SCALE_OUTER` (scales-to-cover-then-crops, the "CSS `background-size:
+  cover`" of OBS bounds types — the right choice for cropping a 16:9 webcam feed down to a
+  square without letterboxing) at 360×360 canvas pixels, `boundsAlignment: 0` (center crop),
+  `alignment: 10` (right|bottom, so `positionX`/`positionY` anchor the PiP's bottom-right
+  corner) at `(1686, 1083)` — a 24px margin from the corner of the real canvas resolution
+  (`1710×1107`, confirmed live via `GetVideoSettings` against the real OBS instance). Like
+  every other release/restore transform, this is just the *initial* value — if the user
+  repositions/resizes the camera square by hand in OBS, the next idle transition snapshots
+  and keeps whatever they set, same as always.
+- **Audio-track routing** (`AppState.applyAudioTrackRouting`, new, called from
+  `beginRecording` right after `applyMicrophonePriority` for every mode): previously every
+  source was implicitly routed to every one of OBS's 6 mixer tracks (confirmed identical audio
+  across all 6 tracks in a real saved file during the original silence-watchdog investigation,
+  see "Silence / presence watchdog" above) — now `SetInputAudioTracks` explicitly splits it:
+  **Track 1 = the full mix** (resolved mic + desktop audio both routed here), **Track 2 =
+  mic only**, **Track 3 = desktop audio only**; the non-resolved mic and the wired mic are
+  routed to no tracks at all. Tracks 4-6 are left empty. Confirmed via
+  `GetProfileParameter` against the real OBS instance (2026-09-09) that no output-format/mode
+  change was needed for this: `Output`/`Mode` is `Simple`, but `SimpleOutput`/`RecTracks` is
+  already `63` (all 6 tracks recorded into the `hybrid_mov` file regardless) — so this was
+  purely a per-source routing change, not a recording-pipeline change.
+- **Audio mode transcodes to mp3-only** (`AppState.transcodeToMP3ThenRegister`, called from
+  `stop(discard:)` in place of the ordinary `LibraryStore.registerCompletedRecording` call,
+  only for `.other`/"Audio"): shells out to `ffmpeg` (`-vn -acodec libmp3lame -q:a 2` —
+  audio-only extraction; no built-in AVFoundation export preset produces mp3, it isn't a
+  codec Apple bundles a licensed encoder for) to extract the audio track, deletes the original
+  `.mov` once the mp3 file actually exists, then registers whichever file survives into the
+  Library. Runs `nonisolated`, detached from `AppState`'s `MainActor` via `Task.detached` —
+  by the time this runs, `stop()`'s own synchronous flow has already finished and
+  `recordingState` is back to `.idle`, so there's no reason to tie a potentially-slow
+  subprocess to the main actor. Falls back to registering the original `.mov` untouched (never
+  silently loses the recording) if `ffmpeg` isn't found at any of the common install paths
+  checked (`/opt/homebrew/bin`, `/usr/local/bin`, `/usr/bin`, `/opt/local/bin`) or the process
+  exits non-zero. `LibraryStore`'s tracked-extensions set (renamed from `videoExtensions` to
+  `mediaExtensions`) includes `mp3` now so the folder-scan reconciliation pass also recognizes
+  these files.
+
+**Follow-up from the first real test (2026-09-09, user report): camera hidden behind the
+screen, sometimes off entirely; Audio mode showed only a `.mov`, no `.mp3`.** Three separate
+fixes:
+
+- **Camera z-order**: `restoreInput` restored the camera before the screen in `beginRecording`
+  with no explicit z-order control, and whichever scene item gets created *later* apparently
+  renders on top in this OBS version — so the screen (created second) was covering the camera
+  entirely. Fixed with a new `AppState.bringCameraToFront()`, called for Guide right after all
+  of that recording's inputs are restored: looks up every scene item in `Guide Recording
+  Setup` (new `OBSClient.getSceneItemList`) and explicitly moves the camera to the highest
+  index (index 0 is the back of the stack/rendered first; the highest index is the front,
+  rendered last/on top) via the new `OBSClient.setSceneItemIndex` — asserting a definite
+  z-order every time regardless of creation order, rather than depending on it.
+- **Camera "sometimes off"**: `restoreInput` previously no-op'd entirely whenever
+  `GetInputList` already showed the input present — correct for a genuinely-fresh input, but
+  wrong for the already-documented "Camera stuck open" case (see "Idle resource
+  minimization" above: `RemoveInput` can report success while the underlying capture session
+  never actually tears down), where the leftover item keeps whatever stale
+  enabled-state/placement it already had *forever*, since nothing ever re-applies fresh
+  values to an item that already "exists". Fixed by making `restoreInput` self-healing: an
+  already-present input now still gets `SetSceneItemEnabled`/`SetSceneItemTransform`
+  re-applied via `findSceneItem`, rather than skipping straight to nothing — so a stuck
+  leftover camera gets nudged back to the right enabled-state/PiP placement on every restore,
+  not just the first time it's freshly created. (Doesn't fix the underlying stuck-capture-
+  session bug itself — there's still no known websocket-reachable fix for that, per the
+  existing "Camera stuck open" investigation; this only stops the *symptom* of a stuck item
+  silently keeping stale settings forever.)
+- **Audio mode's `.mov`-only result, root cause confirmed (2026-09-09): a race in
+  `stop(discard:)` itself, unrelated to ffmpeg — affected every mode's registration, not just
+  Audio's transcode.** A hand-run reproduction of the exact `ffmpeg`/`Process` invocation
+  against a real saved file worked perfectly (exit 0, valid mp3 — command used:
+  `ffmpeg -y -i input.mov -vn -acodec libmp3lame -q:a 2 output.mp3`), and file-based tracing
+  (`log show`/NSLog output wasn't showing up for this ad-hoc-signed process at all, so a
+  temporary plain-file trace was added and then removed once this was confirmed) showed the
+  transcode function was never even being *entered* — the registration branch in
+  `stop(discard:)` was being skipped entirely. Root cause: `stop(discard:)` reads
+  `currentMode` *after* `await waitForEvent("RecordStateChanged", ...)` — but that same
+  `RecordStateChanged`/`STOPPED` event is also handled by `handleRecordStateChanged`, which
+  calls `resetToIdle()` (nil-ing `currentMode`) **synchronously**, as part of the very same
+  event dispatch that resumes `stop()`'s suspended continuation. That reset could win the
+  race and complete before `stop()`'s own continuation resumed, so `let mode = currentMode`
+  after the await could already see `nil`, silently skipping the entire
+  registration/transcode branch — exactly matching a real recording finishing and being
+  staged correctly (confirmed: real files were landing in the temp staging folder) but never
+  getting processed into an mp3. Fixed by capturing `let mode = currentMode` **before** the
+  function's first `await`, at the very top of `stop(discard:)`, so it reflects whatever was
+  actually recording when stop was invoked regardless of anything `resetToIdle()` does to
+  `self.currentMode` afterward. This bug predates this session's changes and could in theory
+  have affected Meetings/Guide registration too on unlucky timing, not just Audio's transcode
+  — Audio mode's extra processing step just made the failure visible and reproducible. Two
+  recordings stranded in the temp staging folder by the pre-fix builds were manually
+  recovered (converted to mp3 by hand, moved into the real Audio folder) rather than lost.
+  **Confirmed fixed by the user with a real Audio-mode recording (2026-09-09)**: mp3 appeared
+  correctly, no leftover `.mov`.
+  - Separately, real ffmpeg-invocation issues found and fixed while investigating (still
+    correct/worth keeping regardless of the race above): **staging folder** — Audio mode
+    records into a temp directory (`AppState.audioStagingDirectory()`, under
+    `FileManager.default.temporaryDirectory`) instead of its real save folder, so the real
+    Audio folder only ever shows the finished mp3 (or, on failure, the moved-back `.mov`),
+    never a transient in-progress file. **stderr is no longer discarded** — the original
+    version redirected both `stdout`/`stderr` to `/dev/null`; now captured via a `Pipe`, read
+    via `readDataToEndOfFile()` **before** `waitUntilExit()` (reading first avoids a classic
+    Process+Pipe deadlock if the child writes enough to fill the pipe before exiting), and
+    logged via `NSLog` on any non-zero exit. **`-map 0:a:0`** added to explicitly select track
+    1 (the full mix) now that the source file has multiple audio streams.
+
+- **Confirmed working end-to-end by the user (2026-09-09)**: camera renders on top and stays
+  enabled in Guide, and an Audio-mode recording correctly ends up as mp3-only with the `.mov`
+  gone. **Still not specifically re-confirmed**: whether the camera PiP's exact crop/corner
+  looks visually right (functionally on top and enabled, per the above, but framing/size
+  wasn't separately called out), and whether the three audio tracks actually contain what
+  they're supposed to (mix/mic-only/desktop-only) — worth a quick `ffmpeg -i file.mov` stream
+  check next time either area is touched.
 
 ## Microphone priority rule
 
@@ -622,6 +774,19 @@ committing if it fails, then `git add -A && git commit && git push`. Don't batch
 changes into one commit.
 
 ## Testing notes
+
+- **Meetings/Audio/Guide rename + restructure (2026-09-09)**: build/install/launch/quit
+  confirmed clean, folder rename verified (identical file counts before/after, every
+  `library.json` entry's rewritten path confirmed to still resolve to a real file). First
+  real Guide/Audio recording surfaced 3 bugs (camera hidden behind screen + sometimes off,
+  Audio mode leaving only a `.mov`) — see "Recording modes" above for the fixes, including
+  the real root cause of the Audio bug (a `currentMode`-nil'd-before-read race in
+  `stop(discard:)`, not an ffmpeg problem). **Confirmed fixed by the user with real
+  recordings (2026-09-09)**: camera renders on top and stays enabled in Guide; Audio mode
+  correctly produces an mp3 with no leftover `.mov`. Still not specifically re-confirmed:
+  camera PiP framing/crop quality, and whether the three audio tracks actually split as
+  intended (inspect a saved file with `ffmpeg -i file.mov` to check per-track content) — worth
+  a quick look next time either area is touched, but not blocking.
 
 Confirmed end-to-end with real hardware (2026-08-21): built, installed to
 `/Applications/RecBar.app`, launched (menu bar icon appears, no Dock icon), connected to a
