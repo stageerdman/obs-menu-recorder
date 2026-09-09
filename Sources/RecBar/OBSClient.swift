@@ -263,6 +263,15 @@ final class OBSClient {
         try await request("SetInputMute", data: ["inputName": inputName, "inputMuted": muted])
     }
 
+    /// Routes an input's audio onto exactly the given mixer tracks (1-6), clearing every
+    /// other track explicitly rather than leaving OBS's default (every source on every
+    /// track) in place — see `AppState.applyAudioTrackRouting`.
+    func setInputAudioTracks(inputName: String, enabledTracks: Set<Int>) async throws {
+        var tracks: [String: Bool] = [:]
+        for i in 1...6 { tracks["\(i)"] = enabledTracks.contains(i) }
+        try await request("SetInputAudioTracks", data: ["inputName": inputName, "inputAudioTracks": tracks])
+    }
+
     func startRecord() async throws {
         try await request("StartRecord")
     }
