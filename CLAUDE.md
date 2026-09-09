@@ -639,16 +639,17 @@ self-certified. This applies especially to:
   interception bug (see "Library window & OneDrive sharing"). Rename and "Move to Folder…"
   were not specifically called out as tested in that pass — worth confirming if either is
   touched again.
-- **Library window — OneDrive sharing, not yet verified at all**: no Azure app registration
-  existed yet as of this writing, so none of `OneDriveAuth`'s device-code flow,
-  `OneDriveClient`'s create-placeholder-then-upload sequence, or the "same link survives
-  content replacement" assumption it depends on have been exercised against a real Microsoft
-  account. Needs, in order: an Azure app registration (public client, "Allow public client
-  flows" on, `Files.ReadWrite`/`offline_access` delegated permissions against `consumers`),
-  the resulting Client ID pasted into `config.json`'s `oneDrive.clientId`, then a real
-  walkthrough — sign-in, upload, copying the link before and after the real upload finishes to
-  confirm it doesn't change, rename syncing to the cloud copy, and confirming no delete action
-  ever appears once a file shows the green uploaded-checkmark icon.
+- **Library window — OneDrive sharing, confirmed working end-to-end (2026-09-09)**: an Azure
+  app registration was created (public client, "Allow public client flows" on,
+  `Files.ReadWrite`/`offline_access` delegated permissions against `consumers`) and its Client
+  ID set in `config.json`'s `oneDrive.clientId`. The user confirmed the full flow works:
+  device-code sign-in, the placeholder+link creation, upload progress, and the completed
+  green-checkmark state. This validates the one real Graph-behavior assumption the design
+  depended on — that scoping `createUploadSession` to the placeholder's existing item id keeps
+  the same id/link valid once the real content replaces it. Not specifically re-confirmed in
+  that pass: rename syncing to the cloud copy, and behavior once the local file is later moved
+  or deleted after a successful upload (cloud-only state) — worth a follow-up check if either
+  is touched again.
 - **Auto-launch-hidden-OBS** (`OBSLauncher`): needs manual verification that OBS actually
   comes up with no window/Dock flash (depends on the user having enabled OBS's own *Settings
   → General → System Tray* → "Run OBS in System Tray when minimized" + "Minimize to Tray
