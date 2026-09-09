@@ -198,15 +198,71 @@ layout changed together, on explicit user request:
   exits non-zero. `LibraryStore`'s tracked-extensions set (renamed from `videoExtensions` to
   `mediaExtensions`) includes `mp3` now so the folder-scan reconciliation pass also recognizes
   these files.
+
+**Follow-up from the first real test (2026-09-09, user report): camera hidden behind the
+screen, sometimes off entirely; Audio mode showed only a `.mov`, no `.mp3`.** Three separate
+fixes:
+
+- **Camera z-order**: `restoreInput` restored the camera before the screen in `beginRecording`
+  with no explicit z-order control, and whichever scene item gets created *later* apparently
+  renders on top in this OBS version — so the screen (created second) was covering the camera
+  entirely. Fixed with a new `AppState.bringCameraToFront()`, called for Guide right after all
+  of that recording's inputs are restored: looks up every scene item in `Guide Recording
+  Setup` (new `OBSClient.getSceneItemList`) and explicitly moves the camera to the highest
+  index (index 0 is the back of the stack/rendered first; the highest index is the front,
+  rendered last/on top) via the new `OBSClient.setSceneItemIndex` — asserting a definite
+  z-order every time regardless of creation order, rather than depending on it.
+- **Camera "sometimes off"**: `restoreInput` previously no-op'd entirely whenever
+  `GetInputList` already showed the input present — correct for a genuinely-fresh input, but
+  wrong for the already-documented "Camera stuck open" case (see "Idle resource
+  minimization" above: `RemoveInput` can report success while the underlying capture session
+  never actually tears down), where the leftover item keeps whatever stale
+  enabled-state/placement it already had *forever*, since nothing ever re-applies fresh
+  values to an item that already "exists". Fixed by making `restoreInput` self-healing: an
+  already-present input now still gets `SetSceneItemEnabled`/`SetSceneItemTransform`
+  re-applied via `findSceneItem`, rather than skipping straight to nothing — so a stuck
+  leftover camera gets nudged back to the right enabled-state/PiP placement on every restore,
+  not just the first time it's freshly created. (Doesn't fix the underlying stuck-capture-
+  session bug itself — there's still no known websocket-reachable fix for that, per the
+  existing "Camera stuck open" investigation; this only stops the *symptom* of a stuck item
+  silently keeping stale settings forever.)
+- **Audio mode's `.mov`-only result**: root cause not fully confirmed (a hand-run reproduction
+  of the exact `ffmpeg`/`Process` invocation against a real saved file worked perfectly, exit
+  0, mp3 produced — see below), but the leading theory is simply *timing*: the old code
+  transcoded in place, so the real Audio folder showed the `.mov` for however long the
+  transcode took (extraction runs at roughly 230x realtime per the reproduction, so a ~90-
+  minute call is still a real ~25 seconds) — checking Finder/the Library window shortly after
+  stopping would see exactly the reported symptom (a `.mov`, no `.mp3` yet), not a real
+  failure. Fixed two ways regardless of which explanation is right: (1) **staging folder** —
+  Audio mode now records into a temp directory (`AppState.audioStagingDirectory()`, under
+  `FileManager.default.temporaryDirectory`) instead of its real save folder at all, so the
+  real Audio folder shows *nothing* until the finished mp3 (or, on failure, the moved-back
+  `.mov`) actually lands there — never a transient in-progress `.mov` to be mistaken for a
+  failure. `transcodeToMP3ThenRegister` now takes the staging path and the real destination
+  folder separately, reads from staging, writes the mp3 straight into the real folder, and
+  deletes the staging `.mov` once the mp3 exists (or moves it into the real folder as the
+  fallback if ffmpeg fails). (2) **stderr is no longer discarded** — the original version
+  redirected both `stdout`/`stderr` to `/dev/null`, so any real ffmpeg failure would have been
+  completely silent and undiagnosable (matching the reported symptom exactly if it *was* a
+  real failure). Now captured via a `Pipe`, read via `readDataToEndOfFile()` **before**
+  `waitUntilExit()` (the correct order — reading first avoids a classic Process+Pipe deadlock
+  if the child ever writes enough output to fill the pipe before exiting) and logged via
+  `NSLog` on any non-zero exit. Also added `-map 0:a:0` to the ffmpeg arguments to explicitly
+  select track 1 (the full mix — see `applyAudioTrackRouting` above) now that the source file
+  has multiple audio streams, rather than trusting ffmpeg's default stream-selection heuristic.
+  Reproduction command used to confirm the base ffmpeg command itself works correctly against
+  a real saved file: `ffmpeg -y -i input.mov -vn -acodec libmp3lame -q:a 2 output.mp3` — exit
+  0, valid mp3 produced, confirming the command syntax was never the problem.
+
 - **Not yet verified end-to-end** (no GUI automation, no way to visually confirm OBS scene
-  composition in this environment — see "Testing notes"): a full build/launch/quit smoke test
-  passed cleanly and `GetVideoSettings`/`GetProfileParameter` were confirmed against the real
-  OBS instance while designing this, but nobody has yet actually started a real Guide
-  recording to confirm the camera PiP looks right (correct corner, no black bars, face
-  actually visible/centered — `boundsAlignment: 0` assumes the webcam roughly centers the
-  user), that Screen/Desktop Sounds actually appear correctly in `Guide Recording Setup` on
-  first use (the code path recreates them from an existing global snapshot that's never been
-  restored into that specific scene before), that the three audio tracks actually contain
+  composition in this environment — see "Testing notes"): the three fixes above passed a
+  clean build/launch/quit smoke test but haven't been exercised with a real recording yet.
+  Still open from the original build: whether the camera PiP looks right (correct corner, no
+  black bars, face actually visible/centered — `boundsAlignment: 0` assumes the webcam
+  roughly centers the user), that Screen/Desktop Sounds actually appear correctly in `Guide
+  Recording Setup` on first use (the code path recreates them from an existing global
+  snapshot that's never been restored into that specific scene before), that the three audio
+  tracks actually contain
   what they're supposed to (mix/mic-only/desktop-only) in a real saved file, or that an Audio
   mode recording actually ends up as mp3-only with no leftover `.mov`.
 
@@ -712,19 +768,21 @@ changes into one commit.
 
 ## Testing notes
 
-- **Meetings/Audio/Guide rename + restructure (2026-09-09), not yet exercised as real
-  recordings**: build/install/launch/quit all confirmed clean, folder rename verified
-  (identical file counts before/after, every `library.json` entry's rewritten path confirmed
-  to still resolve to a real file), and the canvas resolution/profile-track settings used to
-  compute the new values were queried directly against a real running OBS instance — but
-  nobody has started an actual recording in any mode since. Needs, per mode: **Guide** — does
-  the camera PiP look right (corner, crop, no black bars) and does the screen/desktop audio
-  actually show up correctly the first time (recreated from a snapshot never before restored
-  into this specific scene); **all three modes** — inspect a saved file's tracks (e.g. `ffmpeg
-  -i file.mov` lists stream info per track) to confirm track 1 has everything, track 2 is
-  mic-only, track 3 is desktop-only; **Audio** — confirm the finished recording is mp3-only
-  with the `.mov` actually gone, and that the Library window shows the mp3 (not a phantom
-  `.mov` entry).
+- **Meetings/Audio/Guide rename + restructure (2026-09-09)**: build/install/launch/quit
+  confirmed clean, folder rename verified (identical file counts before/after, every
+  `library.json` entry's rewritten path confirmed to still resolve to a real file). **First
+  real Guide/Audio recording surfaced 3 bugs** (camera hidden behind screen + sometimes off,
+  Audio mode leaving only a `.mov`) — see the "Follow-up from the first real test" entry
+  under "Recording modes" above for the fixes. Those fixes themselves are **not yet
+  re-verified with another real recording** — still needs, per mode: **Guide** — does the
+  camera now render on top and stay enabled, does the PiP look right (corner, crop, no black
+  bars); **all three modes** — inspect a saved file's tracks (e.g. `ffmpeg -i file.mov` lists
+  stream info per track) to confirm track 1 has everything, track 2 is mic-only, track 3 is
+  desktop-only; **Audio** — confirm the finished recording is mp3-only with the `.mov`
+  actually gone from both the temp staging folder and the real Audio folder, and that the
+  Library window shows the mp3 (not a phantom `.mov` entry). If Audio mode fails again, check
+  Console.app for `NSLog` output starting "RecBar: ffmpeg" — failures now log ffmpeg's actual
+  stderr instead of discarding it.
 
 Confirmed end-to-end with real hardware (2026-08-21): built, installed to
 `/Applications/RecBar.app`, launched (menu bar icon appears, no Dock icon), connected to a

@@ -232,7 +232,21 @@ final class AppState: ObservableObject {
         // Shared across every mode — recreated into whichever real scene is current now.
         await restoreInput(at: \.micBuiltInRelease, sceneNameOverride: modeConfig.sceneName)
         await restoreInput(at: \.micWiredRelease, sceneNameOverride: modeConfig.sceneName)
-        try await obs.setRecordDirectory(modeConfig.saveFolder)
+        if mode == .guide {
+            // The camera must render above the screen recording, not behind it — creation
+            // order alone doesn't guarantee this (confirmed 2026-09-09 real-usage report:
+            // screen, restored after camera above, ended up drawn on top, hiding the camera
+            // square entirely). Explicitly forces the camera to the frontmost scene-item
+            // position every time, regardless of creation order.
+            await bringCameraToFront()
+        }
+        // Audio mode ("Audio", .other) records into a temp staging folder rather than
+        // straight into its real save folder — ffmpeg reads the staging copy and writes the
+        // mp3 directly into the real folder in stop(discard:)'s transcode step, so the real
+        // Audio folder never shows a transient .mov while a (possibly tens-of-seconds-long)
+        // transcode is still running. See transcodeToMP3ThenRegister.
+        let recordDirectory = mode == .other ? Self.audioStagingDirectory() : modeConfig.saveFolder
+        try await obs.setRecordDirectory(recordDirectory)
         try await applyMicrophonePriority(resolved)
         try await applyAudioTrackRouting(resolved)
         try await obs.startRecord()
@@ -439,11 +453,28 @@ final class AppState: ObservableObject {
         }
         do {
             let existing = try await obs.getInputList()
-            guard !existing.contains(inputConfig.inputName) else { return }
-            guard let itemId = try await obs.createInput(
-                sceneName: sceneName, inputName: inputConfig.inputName,
-                inputKind: inputConfig.lastKnownInputKind, settings: settings
-            ) else { return }
+            let itemId: Int
+            if existing.contains(inputConfig.inputName) {
+                // Already present — most commonly because a prior release's RemoveInput
+                // silently failed to fully take effect (see "Camera stuck open after a real
+                // recording" in CLAUDE.md: RemoveInput can report success while the
+                // underlying capture session never actually tears down). Previously this
+                // just no-op'd entirely, which meant a stuck leftover item kept whatever
+                // stale enabled-state/placement it already had forever — confirmed as a
+                // real-usage contributor to the camera "sometimes off" report (2026-09-09).
+                // Falling through to re-apply enabled/transform below instead makes this
+                // self-healing on every restore, not just on first creation.
+                guard let item = try await obs.findSceneItem(sceneName: sceneName, sourceName: inputConfig.inputName) else {
+                    return // it exists, but not in this scene — nothing fixable from here
+                }
+                itemId = item.sceneItemId
+            } else {
+                guard let newItemId = try await obs.createInput(
+                    sceneName: sceneName, inputName: inputConfig.inputName,
+                    inputKind: inputConfig.lastKnownInputKind, settings: settings
+                ) else { return }
+                itemId = newItemId
+            }
             try await obs.setSceneItemEnabled(sceneName: sceneName, sceneItemId: itemId, enabled: inputConfig.lastKnownEnabled)
             if let transformData = inputConfig.lastKnownTransformJSON.data(using: .utf8),
                var transform = (try? JSONSerialization.jsonObject(with: transformData)) as? [String: Any],
@@ -460,6 +491,19 @@ final class AppState: ObservableObject {
         } catch {
             NSLog("RecBar: failed to restore \(inputConfig.inputName): \(error)")
         }
+    }
+
+    /// Forces the camera to the topmost (frontmost) scene-item position in Guide Recording
+    /// Setup, regardless of the order things were created/restored in — see the call site in
+    /// beginRecording for why this can't just be left to creation order.
+    private func bringCameraToFront() async {
+        let sceneName = config.guideMode.sceneName
+        guard let items = try? await obs.getSceneItemList(sceneName: sceneName),
+              let cameraItem = items.first(where: { $0.sourceName == config.cameraRelease.inputName }) else {
+            return
+        }
+        let frontIndex = items.count - 1
+        try? await obs.setSceneItemIndex(sceneName: sceneName, sceneItemId: cameraItem.sceneItemId, index: frontIndex)
     }
 
     /// Launches OBS hidden if it isn't running yet (no-ops, and claims no ownership, if it's
@@ -665,11 +709,14 @@ final class AppState: ObservableObject {
                     }
                 } else if let outputPath, let mode = currentMode {
                     if mode == .other {
-                        // Audio mode ("Audio", .other) keeps only the sound — see
-                        // transcodeToMP3ThenRegister, which extracts to mp3 and deletes the
-                        // .mov once the mp3 exists, then registers whichever file actually
-                        // survives.
-                        Self.transcodeToMP3ThenRegister(path: outputPath, mode: mode)
+                        // Audio mode ("Audio", .other) keeps only the sound — outputPath is
+                        // the *staging* copy (see beginRecording's audioStagingDirectory());
+                        // transcodeToMP3ThenRegister extracts it to mp3 straight into the
+                        // real save folder, deletes the staging .mov, and registers whichever
+                        // file actually survives.
+                        Self.transcodeToMP3ThenRegister(
+                            stagingPath: outputPath, destinationFolder: mode.config(config).saveFolder, mode: mode
+                        )
                     } else {
                         // Registered here (before resetToIdle nils currentMode) rather than
                         // waiting for the Library window's own folder scan, so a kept
@@ -835,41 +882,85 @@ final class AppState: ObservableObject {
 
     // MARK: - Audio-mode transcode (mp3-only)
 
+    /// Where Audio mode actually records to — a temp staging folder, not the real save
+    /// folder — so the real Audio folder never shows a transient .mov while a (possibly
+    /// tens-of-seconds-long, for a long call) transcode is still running; only the finished
+    /// mp3 (or, on failure, the moved-back .mov) ever lands there. See
+    /// `transcodeToMP3ThenRegister`, which reads from here.
+    nonisolated private static func audioStagingDirectory() -> String {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("RecBar-Audio-Staging", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir.path
+    }
+
     /// Extracts the audio track to mp3 via `ffmpeg` (no built-in AVFoundation export preset
-    /// produces mp3 — it isn't a licensed codec Apple bundles an encoder for) and deletes the
-    /// original .mov once the mp3 exists, so an "Audio" recording ends up as mp3-only on
-    /// disk. `nonisolated` and detached from AppState's MainActor deliberately: this can take
-    /// a while for a long recording and has already fully handed off from `stop()`'s own
+    /// produces mp3 — it isn't a licensed codec Apple bundles an encoder for), writing
+    /// straight into `destinationFolder`, then deletes the staging .mov once the mp3 exists.
+    /// `-map 0:a:0` explicitly picks the first audio stream — track 1, the full mix (see
+    /// `applyAudioTrackRouting`) — rather than trusting ffmpeg's default stream-selection
+    /// heuristic now that the file has multiple audio tracks.
+    ///
+    /// `nonisolated` and detached from AppState's MainActor deliberately: this can take a
+    /// while for a long recording and has already fully handed off from `stop()`'s own
     /// synchronous flow by the time it runs (recordingState is already back to `.idle`), so it
-    /// has no reason to be tied to MainActor at all. Falls back to registering the original
-    /// .mov untouched if ffmpeg is missing or the conversion fails, so a recording is never
-    /// silently lost to a broken transcode step.
-    nonisolated private static func transcodeToMP3ThenRegister(path: String, mode: RecordingMode) {
+    /// has no reason to be tied to MainActor at all. Falls back to *moving* (not just
+    /// registering in place) the staging .mov into `destinationFolder` if ffmpeg is missing or
+    /// the conversion fails, so a recording is never silently lost or stranded in temp —
+    /// stderr is captured and logged on failure rather than discarded, since an earlier
+    /// version of this that discarded it produced a silent, undiagnosable failure in real use
+    /// (2026-09-09).
+    nonisolated private static func transcodeToMP3ThenRegister(stagingPath: String, destinationFolder: String, mode: RecordingMode) {
         Task.detached(priority: .utility) {
+            let baseName = (stagingPath as NSString).lastPathComponent
+
+            func keepMovInstead() {
+                let movDestination = (destinationFolder as NSString).appendingPathComponent(baseName)
+                do {
+                    try FileManager.default.moveItem(atPath: stagingPath, toPath: movDestination)
+                    LibraryStore.registerCompletedRecording(path: movDestination, mode: mode)
+                } catch {
+                    NSLog("RecBar: failed to move staged Audio recording out of temp (\(error)) — left at \(stagingPath)")
+                }
+            }
+
             guard let ffmpegPath = resolveFFmpegPath() else {
-                NSLog("RecBar: ffmpeg not found — keeping the .mov for this Audio recording: \(path)")
-                LibraryStore.registerCompletedRecording(path: path, mode: mode)
+                NSLog("RecBar: ffmpeg not found — keeping the .mov for this Audio recording")
+                keepMovInstead()
                 return
             }
-            let mp3Path = (path as NSString).deletingPathExtension + ".mp3"
+
+            let mp3Name = (baseName as NSString).deletingPathExtension + ".mp3"
+            let mp3Path = (destinationFolder as NSString).appendingPathComponent(mp3Name)
+
             let process = Process()
             process.executableURL = URL(fileURLWithPath: ffmpegPath)
-            process.arguments = ["-y", "-i", path, "-vn", "-acodec", "libmp3lame", "-q:a", "2", mp3Path]
+            process.arguments = [
+                "-y", "-hide_banner", "-loglevel", "error",
+                "-i", stagingPath, "-vn", "-map", "0:a:0", "-acodec", "libmp3lame", "-q:a", "2", mp3Path
+            ]
             process.standardOutput = FileHandle.nullDevice
-            process.standardError = FileHandle.nullDevice
+            let stderrPipe = Pipe()
+            process.standardError = stderrPipe
+
             do {
                 try process.run()
+                // Read (and thereby drain) stderr before waitUntilExit() — reading first
+                // avoids a classic Process+Pipe deadlock if ffmpeg ever writes enough to fill
+                // the pipe buffer before exiting; readDataToEndOfFile() itself already blocks
+                // until the process closes the pipe (i.e. until it exits).
+                let stderrData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
                 process.waitUntilExit()
                 guard process.terminationStatus == 0, FileManager.default.fileExists(atPath: mp3Path) else {
-                    NSLog("RecBar: ffmpeg transcode failed (status \(process.terminationStatus)) for \(path) — keeping the .mov")
-                    LibraryStore.registerCompletedRecording(path: path, mode: mode)
+                    let message = String(data: stderrData, encoding: .utf8) ?? ""
+                    NSLog("RecBar: ffmpeg transcode failed (status \(process.terminationStatus)) — keeping the .mov. ffmpeg said: \(message)")
+                    keepMovInstead()
                     return
                 }
-                try? FileManager.default.removeItem(atPath: path)
+                try? FileManager.default.removeItem(atPath: stagingPath)
                 LibraryStore.registerCompletedRecording(path: mp3Path, mode: mode)
             } catch {
-                NSLog("RecBar: failed to launch ffmpeg (\(error)) — keeping the .mov for \(path)")
-                LibraryStore.registerCompletedRecording(path: path, mode: mode)
+                NSLog("RecBar: failed to launch ffmpeg (\(error)) — keeping the .mov")
+                keepMovInstead()
             }
         }
     }
