@@ -132,6 +132,37 @@ struct ModeConfig: Codable {
     }
 }
 
+/// Settings for the Library window's OneDrive sharing feature. `clientId` is the Application
+/// (client) ID from an Azure app registration the user creates themselves (public client,
+/// "Allow public client flows" enabled, `Files.ReadWrite`/`offline_access` delegated
+/// permissions against the `consumers` tenant for personal Microsoft accounts) — empty by
+/// default, which the Library window's cloud button surfaces as a disabled/explained state
+/// rather than silently failing. See OneDriveAuth.swift/OneDriveClient.swift.
+struct OneDriveConfig: Codable {
+    var clientId: String
+    var rootFolderName: String
+
+    enum CodingKeys: String, CodingKey {
+        case clientId, rootFolderName
+    }
+
+    init(clientId: String, rootFolderName: String) {
+        self.clientId = clientId
+        self.rootFolderName = rootFolderName
+    }
+
+    /// Migration-safe: an older config.json with no oneDrive block at all is handled by
+    /// RecBarConfig's own decodeIfPresent fallback to `.default` below — this decoder only
+    /// needs to cover a oneDrive block that predates `rootFolderName` specifically.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        clientId = try c.decodeIfPresent(String.self, forKey: .clientId) ?? ""
+        rootFolderName = try c.decodeIfPresent(String.self, forKey: .rootFolderName) ?? "RecBar Recordings"
+    }
+
+    static let `default` = OneDriveConfig(clientId: "", rootFolderName: "RecBar Recordings")
+}
+
 struct RecBarConfig: Codable {
     var obsHost: String
     var obsPort: Int
@@ -167,6 +198,7 @@ struct RecBarConfig: Codable {
     /// audio-only sources with no meaningful per-scene transform to preserve anyway.
     var micBuiltInRelease: ReleasableInputConfig
     var micWiredRelease: ReleasableInputConfig
+    var oneDrive: OneDriveConfig
 
     static let `default` = RecBarConfig(
         obsHost: "127.0.0.1",
@@ -203,20 +235,22 @@ struct RecBarConfig: Codable {
         // sceneName here is unused (restoreSharedMicInput takes the target scene explicitly)
         // — kept only because ReleasableInputConfig.makeDefault requires one.
         micBuiltInRelease: .makeDefault(inputName: "Macbook", sceneName: "Meet Recording Setup"),
-        micWiredRelease: .makeDefault(inputName: "Headphones Mic", sceneName: "Meet Recording Setup")
+        micWiredRelease: .makeDefault(inputName: "Headphones Mic", sceneName: "Meet Recording Setup"),
+        oneDrive: .default
     )
 
     enum CodingKeys: String, CodingKey {
         case obsHost, obsPort, obsPassword, sources, salesMode, guideMode, otherMode
         case idleSceneName, cameraRelease, screenRelease, desktopAudioRelease
-        case micBuiltInRelease, micWiredRelease
+        case micBuiltInRelease, micWiredRelease, oneDrive
     }
 
     init(obsHost: String, obsPort: Int, obsPassword: String, sources: SceneSourceNames,
          salesMode: ModeConfig, guideMode: ModeConfig, otherMode: ModeConfig,
          idleSceneName: String, cameraRelease: ReleasableInputConfig,
          screenRelease: ReleasableInputConfig, desktopAudioRelease: ReleasableInputConfig,
-         micBuiltInRelease: ReleasableInputConfig, micWiredRelease: ReleasableInputConfig) {
+         micBuiltInRelease: ReleasableInputConfig, micWiredRelease: ReleasableInputConfig,
+         oneDrive: OneDriveConfig) {
         self.obsHost = obsHost
         self.obsPort = obsPort
         self.obsPassword = obsPassword
@@ -230,6 +264,7 @@ struct RecBarConfig: Codable {
         self.desktopAudioRelease = desktopAudioRelease
         self.micBuiltInRelease = micBuiltInRelease
         self.micWiredRelease = micWiredRelease
+        self.oneDrive = oneDrive
     }
 
     /// Custom decoding so existing config.json files written before the per-mode watchdog
@@ -259,6 +294,7 @@ struct RecBarConfig: Codable {
             ?? .makeDefault(inputName: "Macbook", sceneName: "Meet Recording Setup")
         micWiredRelease = try c.decodeIfPresent(ReleasableInputConfig.self, forKey: .micWiredRelease)
             ?? .makeDefault(inputName: "Headphones Mic", sceneName: "Meet Recording Setup")
+        oneDrive = try c.decodeIfPresent(OneDriveConfig.self, forKey: .oneDrive) ?? .default
     }
 
     private static func decodeModeConfig(
@@ -309,6 +345,7 @@ enum ConfigStore {
         if json["idleSceneName"] == nil || json["cameraRelease"] == nil
             || json["screenRelease"] == nil || json["desktopAudioRelease"] == nil { return true }
         if json["micBuiltInRelease"] == nil || json["micWiredRelease"] == nil { return true }
+        if json["oneDrive"] == nil { return true }
         for key in ["salesMode", "guideMode", "otherMode"] {
             guard let mode = json[key] as? [String: Any] else { continue }
             guard let watchdog = mode["watchdog"] as? [String: Any] else { return true }

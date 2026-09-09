@@ -70,6 +70,20 @@ time + an expandable live-audio-level debug drawer while recording.
   still doesn't show after this, the next suspect is a third-party menu-bar-icon manager (e.g.
   Bartender/Ice/Hidden Bar) forcing all icons monochrome at a layer RecBar can't control from
   its own code.
+- `Sources/RecBar/LibraryStore.swift`, `LibraryViewModel.swift`, `Views/LibraryView.swift`,
+  `FilePromiseDragHandle.swift`, `KeychainHelper.swift`, `OneDriveAuth.swift`,
+  `OneDriveClient.swift` — the Library window (see "Library window & OneDrive sharing" below),
+  opened via a small button added to `PopoverContent`'s header calling
+  `openWindow(id: "library")`, which resolves to a new single-instance `Window("Library", id:
+  "library")` scene in `RecBarApp.swift`. `Window` (as opposed to `WindowGroup`, which spawns a
+  new instance per `openWindow` call with no built-in dedup) requires macOS 14, which is why
+  `Package.swift`/`Resources/Info.plist`'s `LSMinimumSystemVersion` were bumped from 13 to 14
+  for this feature (2026-09-09) — low risk on this single-machine, non-App-Store build. Since
+  RecBar is `LSUIElement`, `LibraryView` toggles `NSApp.setActivationPolicy(.regular/
+  .accessory)` itself from its own `onAppear`/`onDisappear` (never from `init()` — see the
+  crash warning above, which is about launch-time timing specifically; well after launch, from
+  a window's own lifecycle, this is safe) so the window can come to the foreground/Cmd-Tab
+  despite the app having no Dock icon otherwise.
 
 ## obs-websocket requests actually used
 
@@ -504,6 +518,91 @@ a standalone probe script issuing the identical obs-websocket requests against t
 running OBS instance — see "Idle resource minimization, verified via probe" in Testing notes)
 since GUI automation for native macOS apps isn't available in this environment.
 
+## Library window & OneDrive sharing
+
+Added 2026-09-09 (explicit user request) on top of the recording pipeline above: a separate
+window (not the menu-bar popover) listing every recording RecBar has made across the three
+per-mode save folders in one place, tagged by category, with local move/rename and an optional
+per-file OneDrive share link.
+
+- **Tracking**: `LibraryStore` persists an array of `RecordingMetadata` (stable `UUID` identity,
+  independent of filename/path) to its own `~/Library/Application Support/RecBar/library.json`,
+  mirroring `ConfigStore`'s exact load/save shape (same directory, same atomic
+  `[.prettyPrinted, .sortedKeys]` write). Entries are created the instant a kept recording
+  finishes — `AppState.stop(discard:)` calls `LibraryStore.registerCompletedRecording(path:
+  mode:)` using the `outputPath` OBS's `StopRecord` response already returns, *before*
+  `resetToIdle()` nils `currentMode` — rather than waiting for a folder scan to notice a new
+  file. `LibraryStore.reconcile(config:)` (run on `LibraryViewModel`'s `start()` and then every
+  4s on a plain `Timer` while the Library window is open — no FSEvents/DispatchSource infra
+  exists anywhere in this codebase, so this mirrors the elapsed-time timer's own established
+  idiom rather than introducing new machinery) separately folder-scans all three `saveFolder`s
+  for untracked video files (pre-existing recordings, or a mode never opened in the Library
+  before) and prunes entries whose local file is gone: gone-and-never-cloud-linked (`
+  cloudWebUrl == nil`) is deleted outright ("just disappears," per spec), gone-but-cloud-linked
+  keeps its entry with `lastKnownLocalPath` cleared (cloud-only from then on) — `cloudWebUrl`
+  rather than `cloudUploadState` is the signal for "has a live cloud presence worth keeping,"
+  since a link already exists (and was already shown to the user) the moment the placeholder
+  is created, before the real upload even starts.
+- **Local actions**: rename (`LibraryViewModel.rename`) moves the local file in place and, if
+  a cloud item exists, also `PATCH`es its name via `OneDriveClient.rename` — local-only if the
+  file's already gone, cloud-only is not possible to *initiate* (rename UI needs a row, which
+  always has at least one of the two) but is exactly what happens if the local half of that
+  same call fails to find a path. "Reveal in Finder" (`NSWorkspace.activateFileViewerSelecting`)
+  and a "Move to Folder…" `NSOpenPanel` + `FileManager.moveItem` fallback live in a row's `…`
+  menu.
+- **Drag-to-move**: real move-to-Finder semantics (the file actually leaves the folder, not a
+  copy) need `NSFilePromiseProvider` — plain SwiftUI `.onDrag`/`.draggable` backed by a file
+  `URL` only produces a Finder copy. `FilePromiseDragHandle` (`NSViewRepresentable`) wraps a
+  minimal custom `NSView`/`NSDraggingSource` just for the row's grip glyph; AppKit's promise
+  callback (`writePromiseTo:`) does the actual `FileManager.moveItem` to wherever Finder chose,
+  then hops back to `LibraryViewModel.fileMovedOut()` → `reconcile()` — the app never needs to
+  know *where* the file went, only that it's gone, which the existing prune logic already
+  handles. **Row list must not be a SwiftUI `List` on macOS** — confirmed by real-usage report
+  (2026-09-09): drag did nothing at all while every other control (buttons, rename) worked
+  fine, because `List` is backed by `NSTableView`, which intercepts `mouseDown` for its own row
+  tracking before it ever reaches a custom subview's `NSView`. Fixed by using a plain
+  `ScrollView`/`LazyVStack` instead, which has no competing event handling. Also worth noting:
+  the drag-handle `NSView` draws nothing itself (it's a pure hit-target) — `RecordingRow`
+  overlays a static `line.3.horizontal` SF Symbol underneath it purely as a visible affordance,
+  since a real user (not just a script) needs to see something to grab. **Verified working by
+  the user, 2026-09-09.**
+- **OneDrive sharing** (hand-rolled against Microsoft Graph, no MSAL/third-party SDK — same
+  zero-dependency ethos as `OBSClient`'s own hand-rolled obs-websocket protocol; **not yet
+  verified end-to-end** — needs a real Azure app registration + populated `config.json`
+  `oneDrive.clientId`, which hadn't happened as of this writing):
+  - `OneDriveAuth` — OAuth2 **device code flow** against the `consumers` tenant (personal
+    Microsoft accounts, per explicit user choice over work/school), scopes `Files.ReadWrite
+    offline_access`. Chosen over an embedded-webview/redirect auth-code flow because this is a
+    menu-bar app with no webview and no registered custom URL scheme. Only the refresh token
+    is persisted (`KeychainHelper`, plain `Security` framework calls — no entitlements needed,
+    RecBar isn't sandboxed); the access token lives in memory only, re-minted on demand.
+    Requires the Azure app registration to have **"Allow public client flows" enabled**, or
+    device code flow fails outright (`AADSTS7000218`) since there's deliberately no client
+    secret in this design (a public client's device-code/refresh tokens don't need one).
+  - `OneDriveClient`'s upload sequence, in order, is the mechanism behind "see the link
+    immediately, then the real video replaces the placeholder without the link changing":
+    (1) resolve/create `{oneDrive.rootFolderName}/{category}` folder, (2) `PUT` a tiny
+    placeholder file to get a real `DriveItem` id, (3) `POST .../createLink` (anonymous,
+    view-only) on that id — shown to the user right away, before any real bytes move —
+    (4) `POST .../createUploadSession` **scoped to that same existing item id** (not a new
+    item) and `PUT` sequential chunks (8 MiB, a multiple of Graph's required 320 KiB
+    granularity) via `FileHandle` so multi-GB recordings never load fully into memory; scoping
+    the session to the existing id is what's expected to preserve the same id/link once
+    content-replacement finishes — this is the one Graph-behavior assumption in the whole
+    design that most needs confirming against a real account. An app relaunch mid-upload does
+    **not** attempt to resume the interrupted session (Graph's upload-session validity window
+    isn't something to bet on with confidence) — it just restarts `createUploadSession` from
+    byte 0 against the same item id next time the row's cloud button is retried.
+  - **No delete-from-cloud action exists anywhere** — not a state to suppress, an outright
+    omission from `OneDriveClient`'s API surface and the row's `…` menu, so a future edit
+    doesn't casually add one back. Once `cloudUploadState == .uploaded` the row's cloud icon
+    only offers "copy link."
+  - `RecBarConfig.oneDrive: OneDriveConfig` (`clientId` empty by default, `rootFolderName`
+    defaulting to `"RecBar Recordings"`) follows the same migration-safe
+    `decodeIfPresent(...) ?? default` pattern as every other field added to this struct — an
+    empty `clientId` makes the Library window's cloud button surface a clear "set
+    oneDrive.clientId in config.json first" message rather than failing silently.
+
 ## Build / install
 
 No Xcode.app is installed on this machine (only Command Line Tools), so this is a Swift
@@ -511,7 +610,10 @@ Package (`Package.swift`, executable target), not an `.xcodeproj` — `xcodebuil
 unavailable. `build.sh` runs `swift build -c release`, then hand-assembles
 `dist/RecBar.app` (`Contents/MacOS`, `Contents/Info.plist` from `Resources/Info.plist`) and
 ad-hoc code-signs it (`codesign --force --deep --sign -`). `./build.sh --install` also copies
-it to `/Applications/RecBar.app`.
+it to `/Applications/RecBar.app`. `Package.swift`'s `platforms` minimum was bumped from
+`.v13` to `.v14` (and `Resources/Info.plist`'s `LSMinimumSystemVersion` to match) on
+2026-09-09 specifically for the Library window's single-instance `Window` scene type, which
+isn't available on macOS 13 — see "Library window & OneDrive sharing".
 
 ## Git workflow
 
@@ -531,6 +633,23 @@ environment (only Chrome browser automation) — anything requiring an actual cl
 OBS instance, or real audio hardware needs to be walked through with the user rather than
 self-certified. This applies especially to:
 
+- **Library window — local file management, verified 2026-09-09**: window opens via the new
+  popover header button, lists tracked recordings, and drag-out-to-Finder (real move, not
+  copy) confirmed working by the user after fixing the `List`/`NSTableView` mouseDown
+  interception bug (see "Library window & OneDrive sharing"). Rename and "Move to Folder…"
+  were not specifically called out as tested in that pass — worth confirming if either is
+  touched again.
+- **Library window — OneDrive sharing, confirmed working end-to-end (2026-09-09)**: an Azure
+  app registration was created (public client, "Allow public client flows" on,
+  `Files.ReadWrite`/`offline_access` delegated permissions against `consumers`) and its Client
+  ID set in `config.json`'s `oneDrive.clientId`. The user confirmed the full flow works:
+  device-code sign-in, the placeholder+link creation, upload progress, and the completed
+  green-checkmark state. This validates the one real Graph-behavior assumption the design
+  depended on — that scoping `createUploadSession` to the placeholder's existing item id keeps
+  the same id/link valid once the real content replaces it. Not specifically re-confirmed in
+  that pass: rename syncing to the cloud copy, and behavior once the local file is later moved
+  or deleted after a successful upload (cloud-only state) — worth a follow-up check if either
+  is touched again.
 - **Auto-launch-hidden-OBS** (`OBSLauncher`): needs manual verification that OBS actually
   comes up with no window/Dock flash (depends on the user having enabled OBS's own *Settings
   → General → System Tray* → "Run OBS in System Tray when minimized" + "Minimize to Tray
