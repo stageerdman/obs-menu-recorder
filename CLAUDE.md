@@ -51,6 +51,26 @@ time + an expandable live-audio-level debug drawer while recording.
   prompt reaches the user even with the popover closed. The prompt notification carries an
   "I'm here" `UNNotificationAction`; either that action or tapping the notification body
   counts as a presence confirmation (`onConfirm` closure, wired to `AppState.confirmPresence()`).
+- **Menu bar icon: custom brand glyphs, not SF Symbols (2026-09-10, explicit user request to
+  match the new app icon — supersedes the plain-SF-Symbol design described immediately
+  below).** `MenuBarGlyphs` in `RecBarApp.swift` draws RecBar's own idle/recording/paused
+  marks as SwiftUI shapes (a hollow capsule + hollow dot for idle, a plain filled dot for
+  recording, two rounded bars for paused — echoing the capsule/dot/bars mark in
+  `Resources/AppIcon.iconset`) and rasterizes each once via `ImageRenderer` into a cached
+  `NSImage` (`MenuBarGlyphs.render`, `@MainActor` since `ImageRenderer` is main-actor-isolated
+  — a plain top-level `static let` initializer needs that or it won't compile). The watchdog
+  glyph deliberately stays the system `exclamationmark.triangle.fill` SF Symbol — it's a
+  universal warning symbol, not part of RecBar's own brand mark, so replacing it wouldn't add
+  anything. `MenuBarIcon.body` still does `Image(nsImage: glyph).renderingMode(...)
+  .foregroundStyle(tint)` — same line shape as the old `Image(systemName:)` version, just fed
+  a pre-rendered bitmap instead of a system symbol, specifically so the `.renderingMode`/
+  `.foregroundStyle` combination described next (a real, hard-won fix) doesn't have to change.
+  **Not yet visually verified live** (no GUI automation in this environment — see "Testing
+  notes"): whether idle's template rendering still blends with the system menu bar and
+  inverts correctly on click the same way the SF Symbol version did is an open risk this
+  change introduces — `.renderingMode(.template)` is a generic `Image` modifier that should
+  apply the same regardless of the image's source, but it was never exercised against a
+  custom-rendered bitmap before this change, only against `Image(systemName:)`.
 - Menu bar / mode icons are SF Symbols rendered directly (no bundled image assets needed) —
   they pick up template/dark-light behavior for free, and are explicitly tinted rather than
   left to the system's default template rendering, regardless of appearance: actively
