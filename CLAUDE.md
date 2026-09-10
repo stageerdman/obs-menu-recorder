@@ -745,10 +745,25 @@ per-file OneDrive share link.
     **not** attempt to resume the interrupted session (Graph's upload-session validity window
     isn't something to bet on with confidence) — it just restarts `createUploadSession` from
     byte 0 against the same item id next time the row's cloud button is retried.
-  - **No delete-from-cloud action exists anywhere** — not a state to suppress, an outright
-    omission from `OneDriveClient`'s API surface and the row's `…` menu, so a future edit
-    doesn't casually add one back. Once `cloudUploadState == .uploaded` the row's cloud icon
-    only offers "copy link."
+  - **Delete/restore (2026-09-10, explicit user request — supersedes the earlier "no
+    delete-from-cloud action" design note below).** A row's `…` menu now offers "Copy Link"
+    (when `cloudWebUrl != nil`), "Delete Locally" (when a local copy exists), and "Delete from
+    Cloud" (when `cloudUploadState == .uploaded`) — both deletes are per-*side*, not
+    per-entry, gated behind a `confirmationDialog` since the local delete uses
+    `FileManager.trashItem` (Trash, not a hard delete) but the cloud delete has no equivalent
+    undo. `LibraryViewModel.deleteLocal`/`deleteCloud` only drop the `RecordingMetadata` entry
+    entirely (`LibraryStore.remove`) once **both** sides are gone; losing just one side leaves
+    the entry in a restorable state instead — a cloud-only entry (local side gone, cloud
+    still live — the same state `reconcile`'s prune logic already produces for an
+    externally-deleted file with a cloud link) gets a "Restore Locally" menu item
+    (`LibraryViewModel.restoreLocal`, `OneDriveClient.downloadFile`, streamed straight to disk
+    via `URLSession.download` rather than `data(for:)` so a multi-GB recording is never fully
+    memory-resident) that re-downloads it into `item.category.config(config).saveFolder`; a
+    local-only entry after a cloud delete needs no separate "restore" action since the
+    existing upload button (already gated on `cloudUploadState == .none`, which the cloud
+    delete resets it to) already serves as "restore to cloud." `OneDriveClient.delete` treats
+    a `404` as success (already-gone is the desired end state either way). None of this is
+    yet verified against a real OneDrive account — same caveat as the rest of this section.
   - `RecBarConfig.oneDrive: OneDriveConfig` (`clientId` empty by default, `rootFolderName`
     defaulting to `"RecBar Recordings"`) follows the same migration-safe
     `decodeIfPresent(...) ?? default` pattern as every other field added to this struct — an

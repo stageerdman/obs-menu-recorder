@@ -117,6 +117,91 @@ final class LibraryViewModel: ObservableObject {
         reconcile()
     }
 
+    // MARK: - Delete / restore
+    //
+    // Deleting is per-side (local vs. cloud), not per-entry: an entry only actually
+    // disappears once *both* sides are gone. Losing just one side leaves the entry around in
+    // a "restorable" state — cloud-only (offer to download back to disk) or local-only after
+    // a cloud delete (the existing upload button already serves as "restore to cloud", no
+    // separate action needed for that direction).
+
+    /// Moves the local file to the Trash (reversible via macOS's own Trash, not a hard
+    /// delete) and drops `lastKnownLocalPath`. If there's no cloud copy either, nothing is
+    /// left worth tracking and the entry is removed outright; otherwise it becomes a
+    /// cloud-only entry, restorable via `restoreLocal`.
+    func deleteLocal(_ item: RecordingMetadata) {
+        guard let path = item.lastKnownLocalPath else { return }
+        do {
+            try FileManager.default.trashItem(at: URL(fileURLWithPath: path), resultingItemURL: nil)
+        } catch {
+            NSLog("RecBar: failed to trash local file \(path): \(error)")
+            return
+        }
+        var updated = item
+        updated.lastKnownLocalPath = nil
+        if updated.cloudWebUrl == nil {
+            items.removeAll { $0.id == item.id }
+            LibraryStore.remove(id: item.id)
+        } else {
+            updateItem(updated)
+        }
+    }
+
+    /// Deletes the cloud copy via Graph and clears its cloud fields. If there's no local copy
+    /// either (this was a cloud-only entry), nothing is left worth tracking and the entry is
+    /// removed outright; otherwise it becomes a local-only entry, whose existing upload
+    /// button already serves as "restore to cloud".
+    func deleteCloud(_ item: RecordingMetadata) {
+        guard let itemId = item.cloudItemId else { return }
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                try await self.client.delete(itemId: itemId, auth: self.auth)
+                await MainActor.run {
+                    guard var current = self.items.first(where: { $0.id == item.id }) else { return }
+                    current.cloudUploadState = .none
+                    current.cloudItemId = nil
+                    current.cloudWebUrl = nil
+                    current.cloudBytesSent = 0
+                    current.cloudErrorMessage = nil
+                    if current.lastKnownLocalPath == nil {
+                        self.items.removeAll { $0.id == item.id }
+                        LibraryStore.remove(id: item.id)
+                    } else {
+                        self.updateItem(current)
+                    }
+                }
+            } catch {
+                NSLog("RecBar: failed to delete cloud item \(itemId): \(error)")
+                await MainActor.run { self.signInError = "Failed to delete from OneDrive: \(error.localizedDescription)" }
+            }
+        }
+    }
+
+    /// Restores a cloud-only entry (local copy previously deleted) back onto disk by
+    /// downloading it from OneDrive into its category's save folder.
+    func restoreLocal(_ item: RecordingMetadata) {
+        guard item.lastKnownLocalPath == nil, let itemId = item.cloudItemId else { return }
+        let saveFolder = item.category.config(config).saveFolder
+        let destinationPath = (saveFolder as NSString).appendingPathComponent(item.fileName)
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                try await self.client.downloadFile(itemId: itemId, to: destinationPath, auth: self.auth)
+                await MainActor.run {
+                    guard var current = self.items.first(where: { $0.id == item.id }) else { return }
+                    current.lastKnownLocalPath = destinationPath
+                    let attrs = try? FileManager.default.attributesOfItem(atPath: destinationPath)
+                    current.sizeBytes = (attrs?[.size] as? NSNumber)?.int64Value
+                    self.updateItem(current)
+                }
+            } catch {
+                NSLog("RecBar: failed to restore \(item.fileName) from OneDrive: \(error)")
+                await MainActor.run { self.signInError = "Failed to restore from OneDrive: \(error.localizedDescription)" }
+            }
+        }
+    }
+
     // MARK: - Cloud upload
 
     func startCloudUpload(for item: RecordingMetadata) {

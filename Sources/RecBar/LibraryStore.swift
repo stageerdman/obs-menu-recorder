@@ -168,4 +168,12 @@ enum LibraryStore {
         items[index] = item
         save(items)
     }
+
+    /// Drops an entry entirely — used once a recording has been deleted from both the local
+    /// disk and the cloud, so nothing is left worth tracking.
+    static func remove(id: UUID) {
+        var items = load()
+        items.removeAll { $0.id == id }
+        save(items)
+    }
 }

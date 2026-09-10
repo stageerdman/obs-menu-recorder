@@ -99,6 +99,8 @@ private struct RecordingRow: View {
     @ObservedObject var viewModel: LibraryViewModel
     @State private var isEditingName = false
     @State private var editedName: String = ""
+    @State private var pendingDeleteLocal = false
+    @State private var pendingDeleteCloud = false
 
     var body: some View {
         HStack(spacing: 10) {
@@ -154,6 +156,18 @@ private struct RecordingRow: View {
                     .disabled(item.lastKnownLocalPath == nil)
                 Button("Move to Folder…") { viewModel.moveToFolder(item) }
                     .disabled(item.lastKnownLocalPath == nil)
+                if item.cloudWebUrl != nil {
+                    Button("Copy Link") { copyLink(item.cloudWebUrl!) }
+                }
+                Divider()
+                if item.lastKnownLocalPath != nil {
+                    Button("Delete Locally") { pendingDeleteLocal = true }
+                } else if item.cloudItemId != nil {
+                    Button("Restore Locally") { viewModel.restoreLocal(item) }
+                }
+                if item.cloudUploadState == .uploaded {
+                    Button("Delete from Cloud", role: .destructive) { pendingDeleteCloud = true }
+                }
             } label: {
                 Image(systemName: "ellipsis.circle")
             }
@@ -162,6 +176,28 @@ private struct RecordingRow: View {
         }
         .padding(.vertical, 6)
         .padding(.horizontal, 12)
+        .confirmationDialog(
+            "Move \"\((item.fileName as NSString).deletingPathExtension)\" to the Trash?",
+            isPresented: $pendingDeleteLocal, titleVisibility: .visible
+        ) {
+            Button("Delete Locally", role: .destructive) { viewModel.deleteLocal(item) }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(item.cloudWebUrl == nil
+                 ? "This recording has no cloud copy — it will be removed from the Library entirely."
+                 : "The cloud copy will still be kept, and you can restore this file locally from it later.")
+        }
+        .confirmationDialog(
+            "Delete \"\((item.fileName as NSString).deletingPathExtension)\" from OneDrive?",
+            isPresented: $pendingDeleteCloud, titleVisibility: .visible
+        ) {
+            Button("Delete from Cloud", role: .destructive) { viewModel.deleteCloud(item) }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(item.lastKnownLocalPath == nil
+                 ? "This recording has no local copy — it will be removed from the Library entirely."
+                 : "The share link will stop working. The local file will still be kept, and you can re-upload later.")
+        }
     }
 
     private func beginEditing() {

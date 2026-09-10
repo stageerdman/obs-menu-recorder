@@ -164,7 +164,34 @@ final class OneDriveClient {
         }
     }
 
-    // Deliberately no delete-from-cloud method exists anywhere in this client, and no UI
-    // affordance is ever built for one — once a file is uploaded, RecBar never offers to
-    // delete the cloud copy. Don't add one back.
+    /// Deletes the cloud item outright (moves it to the OneDrive recycle bin, same as deleting
+    /// via the web UI — not a RecBar-side undo). 404 is treated as success: the item is already
+    /// gone, which is the caller's desired end state either way.
+    func delete(itemId: String, auth: OneDriveAuth) async throws {
+        let token = try await auth.validAccessToken()
+        var request = URLRequest(url: URL(string: "\(Self.base)/me/drive/items/\(itemId)")!)
+        request.httpMethod = "DELETE"
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        let (data, response) = try await URLSession.shared.data(for: request)
+        let status = (response as? HTTPURLResponse)?.statusCode ?? -1
+        guard (200...299).contains(status) || status == 404 else {
+            throw GraphError.requestFailed(status, String(data: data, encoding: .utf8) ?? "")
+        }
+    }
+
+    /// Downloads a cloud item back to a local path — used to "restore" a cloud-only entry
+    /// (local copy deleted, cloud copy still live) back onto disk. Streams straight to disk via
+    /// `URLSession.download`, never loading a multi-GB recording fully into memory.
+    func downloadFile(itemId: String, to destinationPath: String, auth: OneDriveAuth) async throws {
+        let token = try await auth.validAccessToken()
+        var request = URLRequest(url: URL(string: "\(Self.base)/me/drive/items/\(itemId)/content")!)
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        let (tempURL, response) = try await URLSession.shared.download(for: request)
+        guard let status = (response as? HTTPURLResponse)?.statusCode, (200...299).contains(status) else {
+            throw GraphError.requestFailed((response as? HTTPURLResponse)?.statusCode ?? -1, "download failed")
+        }
+        let destinationURL = URL(fileURLWithPath: destinationPath)
+        try? FileManager.default.removeItem(at: destinationURL)
+        try FileManager.default.moveItem(at: tempURL, to: destinationURL)
+    }
 }
