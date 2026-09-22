@@ -102,6 +102,12 @@ private struct RecordingRow: View {
     @State private var pendingDeleteLocal = false
     @State private var pendingDeleteCloud = false
 
+    /// Renaming/moving/dragging out while a cloud upload is mid-flight is what produced a
+    /// real stuck-duplicate bug (2026-09-14) — see `LibraryViewModel.rename`'s doc comment.
+    private var isUploadBusy: Bool {
+        item.cloudUploadState == .creatingLink || item.cloudUploadState == .uploading
+    }
+
     var body: some View {
         HStack(spacing: 10) {
             // The NSView itself draws nothing (see FilePromiseDragHandle) — this SF Symbol is
@@ -111,13 +117,19 @@ private struct RecordingRow: View {
                 Image(systemName: "line.3.horizontal")
                     .font(.system(size: 11, weight: .semibold))
                     .foregroundStyle(.secondary)
-                FilePromiseDragHandle(localPath: item.lastKnownLocalPath ?? "") {
-                    viewModel.fileMovedOut()
+                if !isUploadBusy {
+                    FilePromiseDragHandle(localPath: item.lastKnownLocalPath ?? "") {
+                        viewModel.fileMovedOut()
+                    }
                 }
             }
             .frame(width: 20, height: 20)
             .opacity(item.lastKnownLocalPath == nil ? 0.2 : 1)
-            .help(item.lastKnownLocalPath == nil ? "" : "Drag to move to another folder")
+            .help(
+                item.lastKnownLocalPath == nil ? ""
+                : isUploadBusy ? "Can't move while uploading to OneDrive"
+                : "Drag to move to another folder"
+            )
 
             Image(systemName: item.category.symbolName)
                 .frame(width: 20)
@@ -132,7 +144,7 @@ private struct RecordingRow: View {
                     Text((item.fileName as NSString).deletingPathExtension)
                         .font(.system(size: 13, weight: .medium))
                         .lineLimit(1)
-                        .onTapGesture(count: 2) { beginEditing() }
+                        .onTapGesture(count: 2) { if !isUploadBusy { beginEditing() } }
                 }
                 HStack(spacing: 6) {
                     Text(item.category.title)
@@ -152,10 +164,11 @@ private struct RecordingRow: View {
 
             Menu {
                 Button("Rename") { beginEditing() }
+                    .disabled(isUploadBusy)
                 Button("Reveal in Finder") { viewModel.revealInFinder(item) }
                     .disabled(item.lastKnownLocalPath == nil)
                 Button("Move to Folder…") { viewModel.moveToFolder(item) }
-                    .disabled(item.lastKnownLocalPath == nil)
+                    .disabled(item.lastKnownLocalPath == nil || isUploadBusy)
                 if item.cloudWebUrl != nil {
                     Button("Copy Link") { copyLink(item.cloudWebUrl!) }
                 }
@@ -172,6 +185,12 @@ private struct RecordingRow: View {
                 Image(systemName: "ellipsis.circle")
             }
             .menuStyle(.borderlessButton)
+            // Without this, Menu draws its own disclosure chevron next to the label by
+            // default — on macOS that renders right on top of the ellipsis.circle icon in
+            // this tight 24pt frame, looking like two overlapping controls (real-usage
+            // report, 2026-09-11). The ellipsis icon already conveys "more options" on its
+            // own, so the built-in indicator is redundant here.
+            .menuIndicator(.hidden)
             .frame(width: 24)
         }
         .padding(.vertical, 6)
@@ -226,13 +245,25 @@ private struct RecordingRow: View {
         case .creatingLink:
             ProgressView().controlSize(.small)
         case .uploading:
-            VStack(alignment: .trailing, spacing: 2) {
-                ProgressView(value: uploadFraction).frame(width: 60)
+            HStack(spacing: 8) {
+                ProgressView(value: uploadFraction).frame(width: 50)
                 if let webUrl = item.cloudWebUrl {
-                    Button("Copy Link") { copyLink(webUrl) }
-                        .buttonStyle(.plain)
-                        .font(.caption2)
+                    Button {
+                        copyLink(webUrl)
+                    } label: {
+                        Image(systemName: "doc.on.doc")
+                    }
+                    .buttonStyle(.plain)
+                    .help("Copy share link")
                 }
+                Button {
+                    viewModel.cancelUpload(item)
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .help("Cancel upload")
             }
         case .uploaded:
             Button {

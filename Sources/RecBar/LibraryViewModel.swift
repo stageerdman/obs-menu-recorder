@@ -27,6 +27,7 @@ final class LibraryViewModel: ObservableObject {
     }
 
     func start() {
+        recoverInterruptedUploads()
         reconcile()
         guard timer == nil else { return }
         let timer = Timer(timeInterval: 4, repeats: true) { [weak self] _ in
@@ -41,15 +42,63 @@ final class LibraryViewModel: ObservableObject {
         timer = nil
     }
 
+    /// Any recording persisted as mid-upload (`.creatingLink`/`.uploading`) can only have
+    /// gotten there in a *previous* app session: an in-flight upload lives entirely in an
+    /// in-memory `Task` (`uploadTasks`) that can't survive a relaunch or a quit-mid-upload, and
+    /// `OneDriveClient` restarts from byte 0 rather than resuming (see its doc comment). Left
+    /// as-is, such an entry is permanently stuck — the cloud control shows only a dead progress
+    /// bar with no retry, `startCloudUpload` refuses any non-`.none`/`.failed` state, and
+    /// rename/move/delete are all disabled while it reads as "uploading" (real-usage
+    /// stuck-upload report, 2026-09-22). So on launch, demote them to `.failed`: that surfaces
+    /// the retry button and unblocks the row's other actions. Any placeholder+link already
+    /// created is preserved (`cloudItemId`/`cloudWebUrl` untouched) so the retry reuses it —
+    /// see `runUpload`.
+    private func recoverInterruptedUploads() {
+        for item in LibraryStore.load()
+        where item.cloudUploadState == .uploading || item.cloudUploadState == .creatingLink {
+            var recovered = item
+            recovered.cloudUploadState = .failed
+            recovered.cloudErrorMessage = "Upload interrupted — click to retry"
+            LibraryStore.update(recovered)
+        }
+    }
+
+    /// Reloads the tracked-recordings list from disk every 4s (see `start()`) — but an item
+    /// actively uploading only has its `cloudBytesSent` progress updated in memory (see
+    /// `updateProgress`), never persisted per-chunk, so a naive full overwrite here would stomp
+    /// the live, smoothly-climbing progress bar with the stale `cloudBytesSent` still on disk
+    /// from when the upload started, every single tick — confirmed real-usage report
+    /// (2026-09-11): the progress bar visibly jumped back to 0 every ~4s during an upload,
+    /// then climbed again until the next tick. Fixed by keeping the in-memory item as-is for
+    /// anything still `.uploading` rather than replacing it with the freshly-loaded disk copy;
+    /// once it settles to `.uploaded`/`.failed` (which *is* persisted immediately via
+    /// `updateItem`), the disk copy already matches and reconcile proceeds normally.
     func reconcile() {
-        items = LibraryStore.reconcile(config: config)
+        let fresh = LibraryStore.reconcile(config: config)
+        let liveUploading = Dictionary(
+            uniqueKeysWithValues: items.filter { $0.cloudUploadState == .uploading }.map { ($0.id, $0) }
+        )
+        items = fresh.map { liveUploading[$0.id] ?? $0 }
     }
 
     // MARK: - Rename
 
     /// Renames both copies when both exist — if the local file is already gone, only the
     /// cloud item (if any) is renamed, per the app's spec.
+    ///
+    /// Refuses while a cloud upload is in flight (`.creatingLink`/`.uploading`) — root cause
+    /// of a real stuck-upload bug (2026-09-14): `startCloudUpload` snapshots `lastKnownLocalPath`
+    /// once into a detached `Task`, and `OneDriveClient.uploadFile` doesn't open the file
+    /// (`FileHandle(forReadingFrom:)`) until after a couple of network round-trips
+    /// (`ensureFolder`/`createPlaceholderAndLink`/`createUploadSession`) — a rename landing in
+    /// that window moves the file out from under the snapshot, so the eventual `FileHandle`
+    /// open fails with "file doesn't exist" and the upload dies. Worse, since the rename
+    /// changes `lastKnownLocalPath` on the *existing* tracked entry, the next `reconcile()`
+    /// folder-scan sees the new filename as untracked and creates a second, brand-new entry
+    /// for the same physical recording — leaving one dead entry (stale path, failed upload)
+    /// and one live one. See `moveToFolder`/`FilePromiseDragHandle` for the same hazard.
     func rename(_ item: RecordingMetadata, to newBaseName: String) {
+        guard item.cloudUploadState != .creatingLink, item.cloudUploadState != .uploading else { return }
         guard let index = items.firstIndex(where: { $0.id == item.id }) else { return }
         var updated = items[index]
         let ext = (updated.fileName as NSString).pathExtension
@@ -94,6 +143,8 @@ final class LibraryViewModel: ObservableObject {
     /// FilePromiseDragHandle), kept because this dev environment has no way to visually
     /// exercise drag-and-drop.
     func moveToFolder(_ item: RecordingMetadata) {
+        // Same stale-path-during-upload hazard as `rename` above — refuse while in flight.
+        guard item.cloudUploadState != .creatingLink, item.cloudUploadState != .uploading else { return }
         guard let path = item.lastKnownLocalPath else { return }
         let panel = NSOpenPanel()
         panel.canChooseDirectories = true
@@ -218,6 +269,31 @@ final class LibraryViewModel: ObservableObject {
         }
     }
 
+    /// Aborts an in-flight upload the user changed their mind about, and best-effort deletes
+    /// the cloud placeholder created for it so no orphaned link/tiny file is left behind, then
+    /// resets the entry to `.none` so the row shows the plain upload button again — ready to
+    /// re-upload later if wanted. The in-flight `runUpload`'s awaited network call throws on
+    /// task cancellation, but its catch ignores cancellation (see there) so it doesn't race
+    /// this reset back to `.failed`.
+    func cancelUpload(_ item: RecordingMetadata) {
+        uploadTasks[item.id]?.cancel()
+        uploadTasks[item.id] = nil
+
+        if let cloudItemId = item.cloudItemId {
+            let client = self.client
+            let auth = self.auth
+            Task { try? await client.delete(itemId: cloudItemId, auth: auth) }
+        }
+
+        guard var current = items.first(where: { $0.id == item.id }) else { return }
+        current.cloudUploadState = .none
+        current.cloudItemId = nil
+        current.cloudWebUrl = nil
+        current.cloudBytesSent = 0
+        current.cloudErrorMessage = nil
+        updateItem(current)
+    }
+
     private func runUpload(itemId: UUID, localPath: String) async {
         setState(itemId, .creatingLink)
         do {
@@ -227,20 +303,32 @@ final class LibraryViewModel: ObservableObject {
             guard var item = items.first(where: { $0.id == itemId }) else { return }
 
             let fileName = (localPath as NSString).lastPathComponent
-            let folderId = try await client.ensureFolder(
-                rootName: config.oneDrive.rootFolderName,
-                categoryName: item.category.title, auth: auth
-            )
-            let created = try await client.createPlaceholderAndLink(
-                fileName: fileName, folderId: folderId, auth: auth
-            )
-            item.cloudItemId = created.itemId
-            item.cloudWebUrl = created.webUrl
+            // Reuse the existing cloud item + link if one was already created (a retry, or an
+            // interrupted upload recovered on launch): `createUploadSession` is scoped to that
+            // same id, so the already-shown share link stays valid — rather than orphaning it
+            // and minting a fresh placeholder+link on every retry (see OneDriveClient.uploadFile's
+            // "restarts from byte 0 against the same existing item id" contract).
+            let uploadItemId: String
+            if let existingItemId = item.cloudItemId, item.cloudWebUrl != nil {
+                uploadItemId = existingItemId
+            } else {
+                let folderId = try await client.ensureFolder(
+                    rootName: config.oneDrive.rootFolderName,
+                    categoryName: item.category.title, auth: auth
+                )
+                let created = try await client.createPlaceholderAndLink(
+                    fileName: fileName, folderId: folderId, auth: auth
+                )
+                item.cloudItemId = created.itemId
+                item.cloudWebUrl = created.webUrl
+                uploadItemId = created.itemId
+            }
             item.cloudUploadState = .uploading
             item.cloudBytesSent = 0
+            item.cloudErrorMessage = nil
             updateItem(item)
 
-            try await client.uploadFile(itemId: created.itemId, localPath: localPath, auth: auth) { [weak self] sent, _ in
+            try await client.uploadFile(itemId: uploadItemId, localPath: localPath, auth: auth) { [weak self] sent, _ in
                 Task { @MainActor in self?.updateProgress(itemId, sent: sent) }
             }
 
@@ -248,6 +336,10 @@ final class LibraryViewModel: ObservableObject {
             finished.cloudUploadState = .uploaded
             updateItem(finished)
         } catch {
+            // A user-initiated cancel (see `cancelUpload`) cancels this task, which surfaces
+            // here as a thrown error — but cancelUpload already reset the entry to `.none`, so
+            // don't clobber that back to `.failed`.
+            if Task.isCancelled { return }
             NSLog("RecBar: OneDrive upload failed: \(error)")
             setState(itemId, .failed, error: error.localizedDescription)
         }
