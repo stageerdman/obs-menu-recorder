@@ -26,6 +26,15 @@ final class OneDriveClient {
     /// inside that requirement and keeps memory flat for multi-GB recordings via FileHandle.
     private static let chunkSize: Int64 = 8 * 1024 * 1024
 
+    /// A large recording is hundreds of chunks; a slow residential upstream drops/stalls/
+    /// throttles at least one of them often enough that "one blip kills the whole upload" made
+    /// multi-GB files rarely finish (real-usage failures: network-connection-lost, timed-out,
+    /// cannot-parse-response — all mid-upload, all NSURLError-class transients). So each chunk
+    /// tolerates this many *consecutive* failures (reset to 0 on any success) before the whole
+    /// upload gives up — enough to ride out a transient outage without masking a genuinely dead
+    /// connection or an unrecoverable client error.
+    private static let maxChunkRetries = 5
+
     /// Dedicated session rather than `URLSession.shared` specifically because of the chunk PUTs
     /// in `uploadFile`: shared's default `timeoutIntervalForRequest` is 60s, so any 8 MiB chunk
     /// that can't finish within a minute (a residential upstream slower than ~1.1 Mbps, or a
@@ -144,22 +153,68 @@ final class OneDriveClient {
         let totalSize = (attrs?[.size] as? NSNumber)?.int64Value ?? 0
 
         var offset: Int64 = 0
+        var consecutiveFailures = 0
         while offset < totalSize {
+            try Task.checkCancellation()
             let end = min(offset + Self.chunkSize, totalSize) - 1
             try fileHandle.seek(toOffset: UInt64(offset))
             let chunk = try fileHandle.read(upToCount: Int(end - offset + 1)) ?? Data()
 
-            // No Authorization header on chunk PUTs — the upload URL itself is pre-authenticated.
-            var chunkRequest = URLRequest(url: uploadUrl)
-            chunkRequest.httpMethod = "PUT"
-            chunkRequest.setValue("bytes \(offset)-\(end)/\(totalSize)", forHTTPHeaderField: "Content-Range")
-            let (_, chunkResponse) = try await session.upload(for: chunkRequest, from: chunk)
-            guard let status = (chunkResponse as? HTTPURLResponse)?.statusCode, (200...202).contains(status) else {
-                throw GraphError.requestFailed((chunkResponse as? HTTPURLResponse)?.statusCode ?? -1, "chunk upload failed")
+            do {
+                // No Authorization header on chunk PUTs — the upload URL itself is pre-authenticated.
+                var chunkRequest = URLRequest(url: uploadUrl)
+                chunkRequest.httpMethod = "PUT"
+                chunkRequest.setValue("bytes \(offset)-\(end)/\(totalSize)", forHTTPHeaderField: "Content-Range")
+                let (_, chunkResponse) = try await session.upload(for: chunkRequest, from: chunk)
+                let status = (chunkResponse as? HTTPURLResponse)?.statusCode ?? -1
+                guard (200...202).contains(status) else {
+                    throw GraphError.requestFailed(status, "chunk upload failed at byte \(offset)")
+                }
+                consecutiveFailures = 0
+                offset = end + 1
+                onProgress(offset, totalSize)
+            } catch {
+                // A cancel (user aborted the upload) must propagate, not be retried.
+                if Task.isCancelled { throw error }
+                // A 4xx other than 429 (throttling) is a genuine client error — bad token,
+                // deleted item, malformed request — that re-sending can't fix, so fail fast
+                // rather than burning the whole retry budget on it. Everything else (network
+                // drops/timeouts, 5xx, 429) is a transient worth retrying.
+                if case GraphError.requestFailed(let code, _) = error,
+                   (400...499).contains(code), code != 429 {
+                    throw error
+                }
+                consecutiveFailures += 1
+                if consecutiveFailures > Self.maxChunkRetries { throw error }
+                // Exponential backoff (capped at 30s), then resume from the byte OneDrive
+                // actually still expects — a chunk may have been partially received before the
+                // drop, so trusting the server's own offset beats blindly re-sending our last one.
+                let delaySeconds = min(pow(2.0, Double(consecutiveFailures)), 30)
+                try await Task.sleep(nanoseconds: UInt64(delaySeconds * 1_000_000_000))
+                if let serverNext = await nextExpectedOffset(uploadUrl: uploadUrl) {
+                    offset = serverNext
+                    onProgress(offset, totalSize)
+                }
             }
-            offset = end + 1
-            onProgress(offset, totalSize)
         }
+    }
+
+    /// Queries a resumable upload session for the next byte OneDrive still expects, so a retry
+    /// after a mid-upload failure resumes from where the server actually left off (it may have
+    /// partially received the chunk we were sending) instead of re-sending from our last offset.
+    /// Returns nil if the session can't be queried — the caller then just retries the same offset.
+    private func nextExpectedOffset(uploadUrl: URL) async -> Int64? {
+        var request = URLRequest(url: uploadUrl)
+        request.httpMethod = "GET"
+        guard let (data, response) = try? await session.data(for: request),
+              (response as? HTTPURLResponse)?.statusCode == 200,
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let ranges = json["nextExpectedRanges"] as? [String],
+              let firstStart = ranges.first?.split(separator: "-").first,
+              let start = Int64(firstStart) else {
+            return nil
+        }
+        return start
     }
 
     func rename(itemId: String, newName: String, auth: OneDriveAuth) async throws {

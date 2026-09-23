@@ -27,13 +27,20 @@ audio hardware must be confirmed with the user (see CLAUDE.md "Testing notes").
 - [ ] Debug drawer ellipsis toggles freely both ways while actively recording.
 
 ## Recently fixed, needs confirmation on real hardware/connection
-- [ ] OneDrive upload timeouts (fixed a4a9947, pushed 2026-09-23): chunk PUTs went
-      through URLSession.shared, whose default 60s timeoutIntervalForRequest failed any
-      8 MiB chunk that couldn't complete in a minute (upstream slower than ~1.1 Mbps, or
-      a stall). OneDriveClient now uses a dedicated URLSession (300s request timeout, 6h
-      resource ceiling). Confirm a large recording that previously timed out now uploads
-      to completion. If it STILL times out, the upstream can't push 8 MiB even in 300s —
-      next lever is lowering OneDriveClient.chunkSize (currently 8 MiB).
+- [ ] OneDrive uploads still failing on large files (fix 2026-09-23, follow-up to a4a9947):
+      the timeout bump wasn't enough — real library.json failures were all mid-upload
+      NSURLError transients (network-connection-lost, cannot-parse-response, timed-out) that
+      each killed the whole upload with no retry, and the manual retry restarted from byte 0,
+      so multi-hundred-MB / multi-GB files rarely finished across a flaky/slow upstream.
+      OneDriveClient.uploadFile now retries each chunk up to maxChunkRetries (5) CONSECUTIVE
+      failures with exponential backoff (capped 30s), resuming from the server's own
+      nextExpectedRanges offset each time (Graph upload sessions are resumable). 4xx-non-429
+      still fails fast; cancel still propagates. Confirm the previously-failed large files
+      (Call Review - Miroslav, DealMakers Roleplay, Sales Call - Michal 2) now upload to
+      completion — click the red exclamation-icloud icon to retry each.
+    - Note (unrelated cosmetic): many uploaded entries have sizeBytes far smaller than
+      cloudBytesSent in library.json, so the in-progress % bar denominator is wrong for
+      those. Separate from the upload failures; not touched here.
 
 ## Known upstream limitations (no in-app fix)
 - OBS quit-time crash (copy_audio_data segfault) — RecBar never quits OBS as a result.
