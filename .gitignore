@@ -4,6 +4,7 @@ DerivedData/
 *.xcuserstate
 xcuserdata/
 .DS_Store
+.env
 dist/
 build/
 *.app

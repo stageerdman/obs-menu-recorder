@@ -1,0 +1,41 @@
+# RecBar — known issues & TODOs
+
+Running list. Most entries are "built but not yet walked end-to-end with real
+hardware/OBS" — there is no GUI automation for native macOS apps in this
+environment, so anything needing a real click, a real OBS instance, or real
+audio hardware must be confirmed with the user (see CLAUDE.md "Testing notes").
+
+## Needs end-to-end verification with the user
+- [ ] Captain Log mode: full walkthrough of a real recording (camera full-frame,
+      no screen/desktop audio, mic priority resolves, file lands in
+      ~/Documents/Recordings/Captain Log). Scene bootstrap verified; recording not.
+- [ ] Watchdog edge cases: WatchdogOverlayWindow surviving a *full-screen* Zoom/Meet
+      call; pause-during-active-prompt suppression + resume not re-triggering;
+      "later deadline wins" confirm-extension logic; desktop audio alone keeping the
+      prompt from firing while the mic is silent.
+- [ ] OneDrive: rename syncing to the cloud copy; behavior after a local file is
+      moved/deleted post-upload (cloud-only state); delete/restore per-side flow.
+      None of the delete/restore paths verified against a real account yet.
+- [ ] Camera PiP (Guide): exact crop/corner framing looks right (functionally on
+      top + enabled, but framing not separately confirmed).
+- [ ] Audio track split: confirm Track 1 = full mix, Track 2 = mic-only,
+      Track 3 = desktop-only in a real saved file (ffmpeg -i file.mov).
+- [ ] Library: rename and "Move to Folder…" (drag-out-to-Finder is confirmed working).
+- [ ] USB mic release at idle: real unplug/replug or stop-then-check the macOS
+      mic-in-use menu bar dot actually clears.
+- [ ] Idle resource minimization driven through RecBar's own UI (only probe-verified).
+- [ ] Debug drawer ellipsis toggles freely both ways while actively recording.
+
+## Recently fixed, needs confirmation on real hardware/connection
+- [ ] OneDrive upload timeouts (fixed a4a9947, pushed 2026-09-23): chunk PUTs went
+      through URLSession.shared, whose default 60s timeoutIntervalForRequest failed any
+      8 MiB chunk that couldn't complete in a minute (upstream slower than ~1.1 Mbps, or
+      a stall). OneDriveClient now uses a dedicated URLSession (300s request timeout, 6h
+      resource ceiling). Confirm a large recording that previously timed out now uploads
+      to completion. If it STILL times out, the upstream can't push 8 MiB even in 300s —
+      next lever is lowering OneDriveClient.chunkSize (currently 8 MiB).
+
+## Known upstream limitations (no in-app fix)
+- OBS quit-time crash (copy_audio_data segfault) — RecBar never quits OBS as a result.
+- Camera "stuck open" after a real recording: RemoveInput can report success while the
+  AVCaptureSession never tears down; only a manual OBS quit/relaunch clears it.

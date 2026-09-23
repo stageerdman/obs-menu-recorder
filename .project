@@ -1,0 +1,7 @@
+modules:
+  - coding
+  - workflow
+  - structure
+  - ux
+secrets: []
+claude_md_generated: true
