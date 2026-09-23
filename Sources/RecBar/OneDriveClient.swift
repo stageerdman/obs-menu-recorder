@@ -26,6 +26,18 @@ final class OneDriveClient {
     /// inside that requirement and keeps memory flat for multi-GB recordings via FileHandle.
     private static let chunkSize: Int64 = 8 * 1024 * 1024
 
+    /// Dedicated session rather than `URLSession.shared` specifically because of the chunk PUTs
+    /// in `uploadFile`: shared's default `timeoutIntervalForRequest` is 60s, so any 8 MiB chunk
+    /// that can't finish within a minute (a residential upstream slower than ~1.1 Mbps, or a
+    /// brief stall) threw `NSURLErrorTimedOut` and failed the whole upload. 300s gives each chunk
+    /// ample room; `timeoutIntervalForResource` caps a full multi-GB upload at a sane ceiling.
+    private let session: URLSession = {
+        let cfg = URLSessionConfiguration.default
+        cfg.timeoutIntervalForRequest = 300
+        cfg.timeoutIntervalForResource = 6 * 60 * 60
+        return URLSession(configuration: cfg)
+    }()
+
     /// Resolves (creating if needed) `{rootName}/{categoryName}` in the user's OneDrive,
     /// returning the category subfolder's item id. Not cached to disk — a user renaming/
     /// moving the OneDrive folder externally shouldn't leave a stale id behind across relaunches.
@@ -40,7 +52,7 @@ final class OneDriveClient {
 
         var getRequest = URLRequest(url: URL(string: "\(Self.base)/me/drive/\(parentPath):/\(encodedName)")!)
         getRequest.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        let (getData, getResponse) = try await URLSession.shared.data(for: getRequest)
+        let (getData, getResponse) = try await session.data(for: getRequest)
         if (getResponse as? HTTPURLResponse)?.statusCode == 200,
            let json = try? JSONSerialization.jsonObject(with: getData) as? [String: Any],
            let id = json["id"] as? String {
@@ -54,7 +66,7 @@ final class OneDriveClient {
         createRequest.httpBody = try JSONSerialization.data(withJSONObject: [
             "name": name, "folder": [String: String](), "@microsoft.graph.conflictBehavior": "rename"
         ])
-        let (createData, createResponse) = try await URLSession.shared.data(for: createRequest)
+        let (createData, createResponse) = try await session.data(for: createRequest)
         guard let status = (createResponse as? HTTPURLResponse)?.statusCode, (200...201).contains(status),
               let json = try? JSONSerialization.jsonObject(with: createData) as? [String: Any],
               let id = json["id"] as? String else {
@@ -76,7 +88,7 @@ final class OneDriveClient {
         uploadRequest.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         uploadRequest.setValue("text/plain", forHTTPHeaderField: "Content-Type")
         uploadRequest.httpBody = Data("RecBar is uploading this recording…".utf8)
-        let (data, response) = try await URLSession.shared.data(for: uploadRequest)
+        let (data, response) = try await session.data(for: uploadRequest)
         guard let status = (response as? HTTPURLResponse)?.statusCode, (200...201).contains(status),
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let itemId = json["id"] as? String else {
@@ -89,7 +101,7 @@ final class OneDriveClient {
         linkRequest.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         linkRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
         linkRequest.httpBody = try JSONSerialization.data(withJSONObject: ["type": "view", "scope": "anonymous"])
-        let (linkData, linkResponse) = try await URLSession.shared.data(for: linkRequest)
+        let (linkData, linkResponse) = try await session.data(for: linkRequest)
         guard let linkStatus = (linkResponse as? HTTPURLResponse)?.statusCode, (200...201).contains(linkStatus),
               let linkJson = try? JSONSerialization.jsonObject(with: linkData) as? [String: Any],
               let link = linkJson["link"] as? [String: Any],
@@ -117,7 +129,7 @@ final class OneDriveClient {
         sessionRequest.httpBody = try JSONSerialization.data(withJSONObject: [
             "item": ["@microsoft.graph.conflictBehavior": "replace"]
         ])
-        let (sessionData, sessionResponse) = try await URLSession.shared.data(for: sessionRequest)
+        let (sessionData, sessionResponse) = try await session.data(for: sessionRequest)
         guard (sessionResponse as? HTTPURLResponse)?.statusCode == 200,
               let sessionJson = try? JSONSerialization.jsonObject(with: sessionData) as? [String: Any],
               let uploadUrlString = sessionJson["uploadUrl"] as? String,
@@ -141,7 +153,7 @@ final class OneDriveClient {
             var chunkRequest = URLRequest(url: uploadUrl)
             chunkRequest.httpMethod = "PUT"
             chunkRequest.setValue("bytes \(offset)-\(end)/\(totalSize)", forHTTPHeaderField: "Content-Range")
-            let (_, chunkResponse) = try await URLSession.shared.upload(for: chunkRequest, from: chunk)
+            let (_, chunkResponse) = try await session.upload(for: chunkRequest, from: chunk)
             guard let status = (chunkResponse as? HTTPURLResponse)?.statusCode, (200...202).contains(status) else {
                 throw GraphError.requestFailed((chunkResponse as? HTTPURLResponse)?.statusCode ?? -1, "chunk upload failed")
             }
@@ -157,7 +169,7 @@ final class OneDriveClient {
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try JSONSerialization.data(withJSONObject: ["name": newName])
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let (data, response) = try await session.data(for: request)
         let status = (response as? HTTPURLResponse)?.statusCode ?? -1
         guard (200...201).contains(status) else {
             throw GraphError.requestFailed(status, String(data: data, encoding: .utf8) ?? "")
@@ -172,7 +184,7 @@ final class OneDriveClient {
         var request = URLRequest(url: URL(string: "\(Self.base)/me/drive/items/\(itemId)")!)
         request.httpMethod = "DELETE"
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let (data, response) = try await session.data(for: request)
         let status = (response as? HTTPURLResponse)?.statusCode ?? -1
         guard (200...299).contains(status) || status == 404 else {
             throw GraphError.requestFailed(status, String(data: data, encoding: .utf8) ?? "")
@@ -186,7 +198,7 @@ final class OneDriveClient {
         let token = try await auth.validAccessToken()
         var request = URLRequest(url: URL(string: "\(Self.base)/me/drive/items/\(itemId)/content")!)
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        let (tempURL, response) = try await URLSession.shared.download(for: request)
+        let (tempURL, response) = try await session.download(for: request)
         guard let status = (response as? HTTPURLResponse)?.statusCode, (200...299).contains(status) else {
             throw GraphError.requestFailed((response as? HTTPURLResponse)?.statusCode ?? -1, "download failed")
         }
