@@ -1,10 +1,63 @@
+<!--
+  This CLAUDE.md is compiled from the AI Control global modules
+  (~/.ai-control/modules: CODING, WORKFLOW, STRUCTURE, UX) — the "Working
+  agreement" section below — followed by RecBar's own project knowledge, which
+  is preserved verbatim under "Project knowledge". See .project for the marker.
+-->
+
+# Working agreement (AI Control)
+
+Compiled from the global modules this project uses (`coding`, `workflow`, `structure`, `ux`).
+These are the standing rules for how work is done here; the RecBar-specific knowledge follows.
+
+## Structure
+- Carry the standard scaffold: `.project`, `CLAUDE.md`, `.gitignore` (always covers `.env`),
+  `.env` (never committed), `updates/`, `issues.txt`.
+- Each update is a folder `updates/YYYY-MM-DD NAME - OPEN|CLOSED/` holding `update vX.md`
+  (goal + phased roadmap + live status) and `wiki.md` (durable decisions/lessons). Reopen by
+  flipping `CLOSED`→`OPEN`.
+- Follow the ecosystem's own norms (here: SwiftPM layout — `Sources/`, `Package.swift`). Keep
+  it flat and simple; add folders only when the project genuinely grows into them.
+
+## Coding
+- Modular by default: every piece understandable and fixable in isolation, with small explicit
+  interfaces and low cross-module coupling — a bug should have one obvious home.
+- Keep it minimal: build only what's truly needed; no speculative abstraction. Prefer reuse
+  over duplication, but don't over-generalize before a second real caller.
+- Test what matters (core logic, risky paths, silent-regression risks); skip trivial glue.
+- Idiomatic to the ecosystem — read the neighbours first; new code should look like it belongs.
+
+## Workflow
+- Commit after every working change — small, focused, one logical unit; honest messages; never
+  commit secrets. Everything lives on GitHub and is pushed regularly.
+- Non-trivial work starts with a phased roadmap recorded in the update's `update vX.md`; most
+  phases end with tests. Keep status current as you go.
+- New API / unfamiliar library / genuinely new design → a throwaway research spike run *outside*
+  the main code, inside the update folder; capture findings in the update's `wiki.md`.
+- Act as an orchestrator: delegate to focused agents and synthesize.
+- Verify by running the actual thing, not just a green test. (Caveat for RecBar: no GUI
+  automation for native macOS apps here — real clicks / real OBS / real hardware are walked
+  through with the user, never self-certified. See "Testing notes" below.)
+
+## UX
+- Any user-facing surface: bring in a dedicated UX-expert agent (several in parallel for a
+  multi-part surface) to think it through.
+- Cut everything unnecessary — every element must earn its place. Minimal visual system: few
+  fonts/colors/sizes on a deliberate scale.
+- Build from standardized, reusable, isolated components with clear interfaces. Accessible and
+  responsive by default; sensible defaults, fast feedback, honest error states over decoration.
+
+---
+
+# Project knowledge
+
 # RecBar
 
 RecBar is a macOS menu-bar-only (no Dock icon) SwiftUI app that remote-controls OBS Studio
-over `obs-websocket` v5 to start/stop/pause recordings across three preconfigured modes
-(Sales Call / Guide / Other Call), each mapped to an OBS scene and a save folder. It shows a
-compact horizontal popover: a 3-button mode picker when idle, transport controls + elapsed
-time + an expandable live-audio-level debug drawer while recording.
+over `obs-websocket` v5 to start/stop/pause recordings across four preconfigured modes
+(Meetings / Audio / Guide / Captain Log), each mapped to an OBS scene and a save folder. It
+shows a compact horizontal popover: a 4-button mode picker when idle, transport controls +
+elapsed time + an expandable live-audio-level debug drawer while recording.
 
 ## Architecture
 
@@ -285,6 +338,82 @@ fixes:
   wasn't separately called out), and whether the three audio tracks actually contain what
   they're supposed to (mix/mic-only/desktop-only) — worth a quick `ffmpeg -i file.mov` stream
   check next time either area is touched.
+
+## Captain Log mode (added 2026-09-11)
+
+A fourth mode, alongside Meetings/Audio/Guide: full-screen camera only (no screen capture, no
+desktop audio), using the same mic-priority resolution as every other mode but explicitly
+excluding desktop audio from muting/routing/the watchdog's watched channels — the same shape
+Guide had before its 2026-09-09 screen+PiP restructure (see "Recording modes" above), just as
+its own mode rather than reusing Guide's. `RecordingMode.captainLog`; title **"Captain Log"**;
+icon `person.fill.viewfinder` (a person framed by a camera viewfinder — reads as
+"selfie/face-recording" without needing any bundled art, consistent with this app's
+SF-Symbols-only icon policy — see the menu-bar-icon lesson in "Architecture" above).
+
+- **New `RecBarConfig.captainLogMode: ModeConfig`** (`sceneName: "Captain Log Recording
+  Setup"`, `saveFolder: "~/Documents/Recordings/Captain Log"`, `watchdog: .defaultOff`, same
+  reasoning as Guide's off-by-default: a solo-facing-camera recording is expected to have long
+  silent stretches while thinking/reading, not the "walked away" case the watchdog exists for).
+  Decoded migration-safely like every other field on this struct — an older config.json
+  missing the whole `captainLogMode` block (checked via `contains(.captainLogMode)`, not just
+  a missing sub-field) falls back to `RecBarConfig.default.captainLogMode` entirely, and
+  `ConfigStore.needsMigrationSave` persists it into the user's real file the first time it
+  loads.
+- **No manual OBS scene setup required, unlike Meetings/Guide's hand-built scenes** — this is
+  the one genuinely new piece of machinery this mode needed. Every source Captain Log uses
+  (the shared camera input, both shared mic inputs) is already created dynamically via the
+  existing `restoreInput`/`releaseInput` mechanism (see "Idle resource minimization" below),
+  so the only missing piece for a scene nobody has built yet is the scene itself existing at
+  all. `AppState.beginRecording` now calls a new `ensureSceneExists(_:)` (extracted from the
+  idle scene's own `ensureIdleSceneExists`, which just calls it with `config.idleSceneName`)
+  for **every** mode's scene right before switching to it — a no-op `GetSceneList` check for
+  Meetings/Audio/Guide's already-existing scenes, but this is what lets "Captain Log Recording
+  Setup" bootstrap itself via `CreateScene` on the very first Captain Log recording, with zero
+  manual OBS setup.
+- **Shares `cameraRelease` (the same OBS input Guide uses) rather than getting its own
+  `ReleasableInputConfig`** — it's the same physical camera device and only one mode ever has
+  it live at a time, so there's no risk of the two-configs-racing-for-one-shared-input bug
+  already documented for the mic sources (see "First attempt at the mic sources was wrong" in
+  "Idle resource minimization" below) — that bug was about the *same scene set* fighting over
+  which config's snapshot wins; here it's strictly one live scene at a time. Restored via
+  `restoreInput(at: \.cameraRelease, sceneNameOverride: modeConfig.sceneName)`, the same
+  shared-input-into-whichever-scene pattern already used for the mic sources.
+- **Camera transform forced full-frame every time, not trusted to the snapshot** — Guide's own
+  cameraRelease snapshot holds whatever PiP placement Guide last left it at (bottom-right
+  square, see "Guide gets a screen recording + camera PiP" above), which would otherwise leak
+  into Captain Log's scene via the ordinary restore/snapshot mechanism. New
+  `AppState.forceCameraFullFrame(sceneName:)`, called right after `restoreInput` for Captain
+  Log only, explicitly sets `boundsType: OBS_BOUNDS_SCALE_OUTER` (scale-to-cover-then-crop —
+  same technique as Guide's PiP, just sized to the whole canvas instead of a 360×360 corner)
+  with `boundsWidth`/`boundsHeight` read fresh from a live `GetVideoSettings` call each time
+  (no dedicated `OBSClient` wrapper exists for this yet — called via the generic
+  `obs.request(_:)` — so this is the one caller) rather than hardcoding the canvas resolution,
+  so a future canvas-resolution change can't leave this silently wrong.
+- **`applyMicrophonePriority`/`applyAudioTrackRouting` both gained an `includeDesktopAudio`
+  parameter** (`beginRecording` passes `mode != .captainLog`) rather than being unconditional
+  again — Captain Log never restores `desktopAudioRelease` at all (skipped alongside
+  `screenRelease` in `beginRecording`, both gated on `mode != .captainLog`), so muting or
+  track-routing a source that doesn't exist in OBS would fail with obs-websocket's
+  `ResourceNotFound` (600) — the exact "OBS request failed (600): No source was found" class of
+  bug already hit and fixed for Guide once before this mode existed (see "Guide-only" entries
+  under "Idle resource minimization" below); this reintroduces that same conditional
+  deliberately rather than repeating the mistake for a fourth mode.
+- **Library/OneDrive window needed zero changes** — `LibraryStore.reconcile`/
+  `registerCompletedRecording` and `LibraryView` are already fully generic over
+  `RecordingMode.allCases`/`mode.config(config).saveFolder`, so Captain Log recordings are
+  tracked, folder-scanned, and shareable exactly like every other mode's the moment the save
+  folder (`~/Documents/Recordings/Captain Log`, created on disk alongside the others) has
+  anything in it.
+- **`SelectionView`'s mode-picker row widened from 300pt to 320pt** (matching
+  `RecordingView`'s existing width, so the popover doesn't change width between the idle and
+  recording views) and its `HStack` spacing/padding tightened (14→10 / 16→12) to fit a 4th
+  button without the row feeling cramped.
+- **Not yet verified end-to-end with real hardware** (no GUI automation for native macOS apps
+  in this environment — see "Testing notes" below): the scene bootstraps correctly per a clean
+  `./build.sh --install` + relaunch and the migrated `config.json` showing the right
+  `captainLogMode` block, but a real Captain Log recording (camera actually appears full-frame
+  with no screen/desktop-audio, mic priority resolves correctly, the file lands in
+  `~/Documents/Recordings/Captain Log`) still needs a walkthrough with the user.
 
 ## Microphone priority rule
 

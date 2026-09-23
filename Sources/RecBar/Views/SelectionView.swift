@@ -15,12 +15,12 @@ struct SelectionView: View {
                     .padding(.top, 10)
             }
 
-            HStack(spacing: 14) {
+            HStack(spacing: 10) {
                 ForEach(RecordingMode.allCases) { mode in
                     ModeButton(mode: mode)
                 }
             }
-            .padding(16)
+            .padding(12)
 
             if appState.connectionState != .connected {
                 Label(appState.isBusy ? "Launching OBS…" : "OBS not connected", systemImage: "exclamationmark.triangle.fill")
@@ -29,7 +29,7 @@ struct SelectionView: View {
                     .padding(.bottom, 12)
             }
         }
-        .frame(width: 300)
+        .frame(width: 320)
     }
 }
 

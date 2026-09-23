@@ -171,6 +171,13 @@ struct RecBarConfig: Codable {
     var salesMode: ModeConfig
     var guideMode: ModeConfig
     var otherMode: ModeConfig
+    /// Captain Log: full-screen camera only, no screen capture/desktop audio — same
+    /// mic-priority/no-desktop-audio shape as Guide (see AppState.beginRecording). Its OBS
+    /// scene is auto-created on first use (see AppState.ensureSceneExists), and the camera
+    /// input it shares with Guide (`cameraRelease`) is forced full-frame every time via
+    /// `AppState.forceCameraFullFrame` rather than trusting whatever transform Guide's own
+    /// PiP placement last left behind.
+    var captainLogMode: ModeConfig
     /// Scene RecBar switches OBS to whenever it isn't actively recording, to release
     /// screen-capture/desktop-audio/scene-local-mic resources without quitting OBS (see
     /// AppState.goIdleInOBS()). Auto-created via CreateScene if it doesn't already exist.
@@ -237,6 +244,13 @@ struct RecBarConfig: Codable {
             saveFolder: "/Users/stage/Documents/Recordings/Audio",
             watchdog: .defaultOn
         ),
+        captainLogMode: ModeConfig(
+            sceneName: "Captain Log Recording Setup",
+            saveFolder: "/Users/stage/Documents/Recordings/Captain Log",
+            // Off by default, same reasoning as Guide: a solo-facing-camera recording is
+            // expected to have long stretches of on-mic silence while thinking/reading.
+            watchdog: .defaultOff
+        ),
         idleSceneName: "RecBar Idle",
         cameraRelease: .makeDefault(inputName: "Capture Card Device", sceneName: "Guide Recording Setup"),
         screenRelease: .makeDefault(inputName: "Screen", sceneName: "Meet Recording Setup"),
@@ -249,13 +263,14 @@ struct RecBarConfig: Codable {
     )
 
     enum CodingKeys: String, CodingKey {
-        case obsHost, obsPort, obsPassword, sources, salesMode, guideMode, otherMode
+        case obsHost, obsPort, obsPassword, sources, salesMode, guideMode, otherMode, captainLogMode
         case idleSceneName, cameraRelease, screenRelease, desktopAudioRelease
         case micBuiltInRelease, micWiredRelease, oneDrive
     }
 
     init(obsHost: String, obsPort: Int, obsPassword: String, sources: SceneSourceNames,
          salesMode: ModeConfig, guideMode: ModeConfig, otherMode: ModeConfig,
+         captainLogMode: ModeConfig,
          idleSceneName: String, cameraRelease: ReleasableInputConfig,
          screenRelease: ReleasableInputConfig, desktopAudioRelease: ReleasableInputConfig,
          micBuiltInRelease: ReleasableInputConfig, micWiredRelease: ReleasableInputConfig,
@@ -267,6 +282,7 @@ struct RecBarConfig: Codable {
         self.salesMode = salesMode
         self.guideMode = guideMode
         self.otherMode = otherMode
+        self.captainLogMode = captainLogMode
         self.idleSceneName = idleSceneName
         self.cameraRelease = cameraRelease
         self.screenRelease = screenRelease
@@ -292,6 +308,15 @@ struct RecBarConfig: Codable {
         salesMode = try Self.decodeModeConfig(c, forKey: .salesMode, defaultWatchdog: .defaultOn)
         guideMode = try Self.decodeModeConfig(c, forKey: .guideMode, defaultWatchdog: .defaultOff)
         otherMode = try Self.decodeModeConfig(c, forKey: .otherMode, defaultWatchdog: .defaultOn)
+        // Whole block is new (2026-09-11) — an older config.json won't have this key at all,
+        // not just a missing watchdog sub-field, so this checks for the key itself first
+        // rather than going through decodeModeConfig (which assumes the key is present and
+        // would throw otherwise).
+        if c.contains(.captainLogMode) {
+            captainLogMode = try Self.decodeModeConfig(c, forKey: .captainLogMode, defaultWatchdog: .defaultOff)
+        } else {
+            captainLogMode = RecBarConfig.default.captainLogMode
+        }
         idleSceneName = try c.decodeIfPresent(String.self, forKey: .idleSceneName) ?? "RecBar Idle"
         cameraRelease = try c.decodeIfPresent(ReleasableInputConfig.self, forKey: .cameraRelease)
             ?? .makeDefault(inputName: "Capture Card Device", sceneName: "Guide Recording Setup")
@@ -355,7 +380,8 @@ enum ConfigStore {
             || json["screenRelease"] == nil || json["desktopAudioRelease"] == nil { return true }
         if json["micBuiltInRelease"] == nil || json["micWiredRelease"] == nil { return true }
         if json["oneDrive"] == nil { return true }
-        for key in ["salesMode", "guideMode", "otherMode"] {
+        if json["captainLogMode"] == nil { return true }
+        for key in ["salesMode", "guideMode", "otherMode", "captainLogMode"] {
             guard let mode = json[key] as? [String: Any] else { continue }
             guard let watchdog = mode["watchdog"] as? [String: Any] else { return true }
             if watchdog["confirmExtensionSeconds"] == nil { return true }

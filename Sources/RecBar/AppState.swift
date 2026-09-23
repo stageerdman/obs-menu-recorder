@@ -5,6 +5,7 @@ enum RecordingMode: String, CaseIterable, Identifiable, Codable {
     case sales
     case guide
     case other
+    case captainLog
 
     var id: String { rawValue }
 
@@ -18,6 +19,7 @@ enum RecordingMode: String, CaseIterable, Identifiable, Codable {
         case .sales: return "Meetings"
         case .guide: return "Guide"
         case .other: return "Audio"
+        case .captainLog: return "Captain Log"
         }
     }
 
@@ -26,6 +28,7 @@ enum RecordingMode: String, CaseIterable, Identifiable, Codable {
         case .sales: return "video.fill" // camera — was Guide's icon before Guide gained one of its own
         case .guide: return "cursorarrow.click" // screen recording / mouse click
         case .other: return "mic.fill"
+        case .captainLog: return "person.fill.viewfinder" // person framed by a camera — selfie/face recording
         }
     }
 
@@ -34,6 +37,7 @@ enum RecordingMode: String, CaseIterable, Identifiable, Codable {
         case .sales: return config.salesMode
         case .guide: return config.guideMode
         case .other: return config.otherMode
+        case .captainLog: return config.captainLogMode
         }
     }
 }
@@ -219,16 +223,31 @@ final class AppState: ObservableObject {
 
         let resolved = try MicrophonePriority.resolve()
         let modeConfig = mode.config(config)
+        // Captain Log's scene doesn't need to be pre-built by hand like Meet/Guide's do —
+        // every source it uses (camera, both mic inputs) is already dynamically created via
+        // restoreInput below, so the only missing piece is the scene itself existing at all.
+        // No-op for the other modes' already-existing scenes.
+        try await ensureSceneExists(modeConfig.sceneName)
 
         try await obs.setCurrentProgramScene(modeConfig.sceneName)
         if mode == .guide {
             await restoreInput(at: \.cameraRelease)
+        } else if mode == .captainLog {
+            await restoreInput(at: \.cameraRelease, sceneNameOverride: modeConfig.sceneName)
+            // Guide leaves the camera at whatever PiP placement it was last snapshotted at
+            // (see cameraRelease's doc comment) — wrong for Captain Log, which wants the same
+            // shared camera input filling the whole frame instead, so this is forced
+            // explicitly every time rather than trusted to the snapshot.
+            await forceCameraFullFrame(sceneName: modeConfig.sceneName)
         }
-        // Screen + desktop audio are shared globally across every mode now, including Guide
-        // (small camera-square PiP over a full screen recording, plus its own desktop audio —
-        // 2026-09-09) — same shared-input pattern as the mic sources just below.
-        await restoreInput(at: \.screenRelease, sceneNameOverride: modeConfig.sceneName)
-        await restoreInput(at: \.desktopAudioRelease, sceneNameOverride: modeConfig.sceneName)
+        // Screen + desktop audio are shared globally across Meetings/Audio/Guide (small
+        // camera-square PiP over a full screen recording, plus its own desktop audio —
+        // 2026-09-09) — same shared-input pattern as the mic sources just below. Captain Log
+        // is camera-only, so it skips both entirely.
+        if mode != .captainLog {
+            await restoreInput(at: \.screenRelease, sceneNameOverride: modeConfig.sceneName)
+            await restoreInput(at: \.desktopAudioRelease, sceneNameOverride: modeConfig.sceneName)
+        }
         // Shared across every mode — recreated into whichever real scene is current now.
         await restoreInput(at: \.micBuiltInRelease, sceneNameOverride: modeConfig.sceneName)
         await restoreInput(at: \.micWiredRelease, sceneNameOverride: modeConfig.sceneName)
@@ -247,8 +266,15 @@ final class AppState: ObservableObject {
         // transcode is still running. See transcodeToMP3ThenRegister.
         let recordDirectory = mode == .other ? Self.audioStagingDirectory() : modeConfig.saveFolder
         try await obs.setRecordDirectory(recordDirectory)
-        try await applyMicrophonePriority(resolved)
-        try await applyAudioTrackRouting(resolved)
+        // Captain Log never restores desktopAudioRelease above, so that source doesn't exist
+        // in OBS at this point — muting/routing it here would fail with obs-websocket's
+        // ResourceNotFound (600), the same "OBS request failed (600): No source was found"
+        // bug already hit and fixed for Guide once before (see CLAUDE.md's "Idle resource
+        // minimization"/"Guide-only" entries) when it unconditionally touched a source only
+        // Meetings/Audio actually restore.
+        let includeDesktopAudio = mode != .captainLog
+        try await applyMicrophonePriority(resolved, includeDesktopAudio: includeDesktopAudio)
+        try await applyAudioTrackRouting(resolved, includeDesktopAudio: includeDesktopAudio)
         try await obs.startRecord()
 
         let started = await waitForEvent("RecordStateChanged", timeout: 5) { data in
@@ -262,7 +288,7 @@ final class AppState: ObservableObject {
         resolvedMicDescription = "\(resolved.deviceName) (\(resolved.role == .usb ? "USB" : "built-in"))"
         resolvedMicSourceName = resolved.role == .usb ? config.sources.micUSBSourceName : config.sources.micBuiltInSourceName
         watchdogChannelNames = Set([resolvedMicSourceName].compactMap { $0 })
-        if mode != .guide {
+        if mode != .guide && mode != .captainLog {
             watchdogChannelNames.insert(config.sources.desktopAudioSourceName)
         }
         watchdogEnabled = modeConfig.watchdog.enabled
@@ -275,22 +301,35 @@ final class AppState: ObservableObject {
     }
 
     /// Mutes every configured mic source except the one that should be active, and unmutes
-    /// desktop audio (unconditionally now — every mode restores `desktopAudioRelease` as of
-    /// 2026-09-09, including Guide, so there's no missing-source case to guard against
-    /// anymore; see the historical note this replaced in git history if that ever regresses).
-    /// Re-writes the USB source's device_id every time, since OBS's saved device_id can go
-    /// stale between physical (dis)connects.
-    private func applyMicrophonePriority(_ resolved: ResolvedMic) async throws {
+    /// desktop audio when `includeDesktopAudio` (every mode restores `desktopAudioRelease` as
+    /// of 2026-09-09 — Meetings, Audio, and Guide — except Captain Log, which is camera-only
+    /// and never restores that source at all, so muting/unmuting it would fail with
+    /// obs-websocket's ResourceNotFound; see the beginRecording call site). Re-writes the USB
+    /// source's device_id every time, since OBS's saved device_id can go stale between
+    /// physical (dis)connects.
+    private func applyMicrophonePriority(_ resolved: ResolvedMic, includeDesktopAudio: Bool) async throws {
         let sources = config.sources
 
         if resolved.role == .usb {
             try await obs.setInputSettings(inputName: sources.micUSBSourceName, settings: ["device_id": resolved.deviceUID])
+            // `USB PnP`'s device_id was just rewritten from empty (goIdleInOBS clears it — see
+            // releaseUSBMicIfLive) to the live device. Confirmed via direct probing against a
+            // real OBS 32.2.2 instance (2026-09-11) that a source assigned to a track while
+            // still producing genuine silence (no device actually attached yet) can cause a
+            // *different*, muted, zero-tracks source to bleed onto that track and onto every
+            // other unassigned track instead — not just leave it silent as intended. This short
+            // settle delay reduces the odds of `StartRecord` firing before the device has
+            // actually attached and started producing samples; `stripUnusedAudioTracksAndRegister`
+            // below is the actual guarantee, this is defense in depth.
+            try? await Task.sleep(nanoseconds: 300_000_000)
         }
 
         try await obs.setInputMute(inputName: sources.micUSBSourceName, muted: resolved.role != .usb)
         try await obs.setInputMute(inputName: sources.micBuiltInSourceName, muted: resolved.role != .builtIn)
         try await obs.setInputMute(inputName: sources.micWiredSourceName, muted: true)
-        try await obs.setInputMute(inputName: sources.desktopAudioSourceName, muted: false)
+        if includeDesktopAudio {
+            try await obs.setInputMute(inputName: sources.desktopAudioSourceName, muted: false)
+        }
     }
 
     /// Splits the recording's audio across mixer tracks instead of OBS's default of every
@@ -301,13 +340,18 @@ final class AppState: ObservableObject {
     /// `SimpleOutput`/`RecTracks` is already `63` (all 6 tracks recorded into the file
     /// regardless of per-source routing), so this only needed to change *which* sources feed
     /// which tracks, not how many tracks get muxed into the output file.
-    private func applyAudioTrackRouting(_ resolved: ResolvedMic) async throws {
+    ///
+    /// `includeDesktopAudio` is false only for Captain Log, which never restores that source
+    /// at all (see beginRecording) — routing tracks for a nonexistent input would fail.
+    private func applyAudioTrackRouting(_ resolved: ResolvedMic, includeDesktopAudio: Bool) async throws {
         let sources = config.sources
         let resolvedMicName = resolved.role == .usb ? sources.micUSBSourceName : sources.micBuiltInSourceName
         let otherMicName = resolved.role == .usb ? sources.micBuiltInSourceName : sources.micUSBSourceName
 
         try await obs.setInputAudioTracks(inputName: resolvedMicName, enabledTracks: [1, 2])
-        try await obs.setInputAudioTracks(inputName: sources.desktopAudioSourceName, enabledTracks: [1, 3])
+        if includeDesktopAudio {
+            try await obs.setInputAudioTracks(inputName: sources.desktopAudioSourceName, enabledTracks: [1, 3])
+        }
         try await obs.setInputAudioTracks(inputName: otherMicName, enabledTracks: [])
         try await obs.setInputAudioTracks(inputName: sources.micWiredSourceName, enabledTracks: [])
     }
@@ -353,9 +397,20 @@ final class AppState: ObservableObject {
     }
 
     private func ensureIdleSceneExists() async throws {
+        try await ensureSceneExists(config.idleSceneName)
+    }
+
+    /// Auto-creates a scene if it doesn't already exist. Meetings/Audio/Guide's scenes are
+    /// still expected to be hand-built by the user (their mic/screen/desktop-audio sources
+    /// only work by name, not by anything RecBar could infer), but Captain Log's scene needs
+    /// nothing pre-built — every source it uses is already created dynamically via
+    /// restoreInput — so this lets its scene bootstrap itself on first use rather than
+    /// requiring a manual OBS setup step. No-ops (one extra GetSceneList call) for scenes that
+    /// already exist, which is every call site except Captain Log's first-ever run.
+    private func ensureSceneExists(_ name: String) async throws {
         let scenes = try await obs.getSceneList()
-        guard !scenes.contains(config.idleSceneName) else { return }
-        try await obs.createScene(config.idleSceneName)
+        guard !scenes.contains(name) else { return }
+        try await obs.createScene(name)
     }
 
     /// Scene item transform keys that SetSceneItemTransform actually accepts — GetSceneItemList
@@ -504,6 +559,39 @@ final class AppState: ObservableObject {
         }
         let frontIndex = items.count - 1
         try? await obs.setSceneItemIndex(sceneName: sceneName, sceneItemId: cameraItem.sceneItemId, index: frontIndex)
+    }
+
+    /// Forces the (shared) camera scene item to fill the whole canvas, regardless of whatever
+    /// placement it was last snapshotted at — needed because `cameraRelease`'s snapshot is
+    /// shared with Guide's own PiP placement (see the doc comment on `RecBarConfig.cameraRelease`'s
+    /// use in beginRecording), so restoreInput alone would carry Guide's small PiP transform
+    /// into Captain Log's scene instead of filling it. Uses `OBS_BOUNDS_SCALE_OUTER` (scale to
+    /// cover, then crop — the same "CSS `background-size: cover`" bounds type already used for
+    /// Guide's PiP square) sized to the real canvas resolution so this fills the frame
+    /// correctly regardless of the webcam's native aspect ratio, rather than assuming scale 1
+    /// happens to match. Reads the canvas size fresh each time (`GetVideoSettings` has no
+    /// dedicated wrapper on OBSClient — this is the only caller) instead of hardcoding it, so a
+    /// future canvas-resolution change doesn't leave this stale.
+    private func forceCameraFullFrame(sceneName: String) async {
+        guard let item = try? await obs.findSceneItem(sceneName: sceneName, sourceName: config.cameraRelease.inputName) else {
+            return
+        }
+        var canvasWidth: Double = 1
+        var canvasHeight: Double = 1
+        if let videoSettings = try? await obs.request("GetVideoSettings"),
+           let outputWidth = (videoSettings["outputWidth"] as? NSNumber)?.doubleValue,
+           let outputHeight = (videoSettings["outputHeight"] as? NSNumber)?.doubleValue {
+            canvasWidth = outputWidth
+            canvasHeight = outputHeight
+        }
+        let transform: [String: Any] = [
+            "positionX": 0, "positionY": 0, "rotation": 0,
+            "scaleX": 1, "scaleY": 1, "alignment": 5,
+            "boundsType": "OBS_BOUNDS_SCALE_OUTER", "boundsAlignment": 0,
+            "boundsWidth": canvasWidth, "boundsHeight": canvasHeight,
+            "cropTop": 0, "cropBottom": 0, "cropLeft": 0, "cropRight": 0, "cropToBounds": false
+        ]
+        try? await obs.setSceneItemTransform(sceneName: sceneName, sceneItemId: item.sceneItemId, transform: transform)
     }
 
     /// Launches OBS hidden if it isn't running yet (no-ops, and claims no ownership, if it's
@@ -732,8 +820,10 @@ final class AppState: ObservableObject {
                         // waiting for the Library window's own folder scan, so a kept
                         // recording is tracked the instant it exists — see
                         // LibraryStore.reconcile for the separate pass that also picks up
-                        // pre-existing/untracked files.
-                        LibraryStore.registerCompletedRecording(path: outputPath, mode: mode)
+                        // pre-existing/untracked files. Tracks 4-6 are stripped first (see
+                        // stripUnusedAudioTracksAndRegister) rather than kept as-is, since
+                        // they're not guaranteed to actually be silent — see its doc comment.
+                        Self.stripUnusedAudioTracksAndRegister(path: outputPath, mode: mode)
                     }
                 }
 
@@ -971,6 +1061,86 @@ final class AppState: ObservableObject {
             } catch {
                 NSLog("RecBar: failed to launch ffmpeg (\(error)) — keeping the .mov")
                 keepMovInstead()
+            }
+        }
+    }
+
+    /// Remuxes a completed Meetings/Guide recording down to its first 3 audio streams (Track 1
+    /// full mix, Track 2 mic-only, Track 3 desktop-only — see `applyAudioTrackRouting`) and
+    /// drops tracks 4-6 entirely, rather than trusting OBS to have actually left them silent.
+    ///
+    /// **Why this exists (2026-09-11 investigation)**: a real saved recording
+    /// (`Martin.mov`) was found to have non-silent, mutually-identical audio on tracks 4-6,
+    /// correlated with the mic-only track — contradicting `applyAudioTrackRouting`'s explicit
+    /// `enabledTracks: []` for the non-resolved mic and `Headphones Mic`. Reproduced directly
+    /// against the real running OBS 32.2.2 instance via a standalone websocket probe (not
+    /// committed): `SetInputAudioTracks`/`SetInputMute` both apply correctly and instantly on
+    /// readback (confirmed via `GetInputAudioTracks`/`GetInputMute`, including mid-recording),
+    /// so the request/response layer itself isn't lying — but when one track's *assigned*
+    /// source is producing genuine silence (reproduced by leaving `USB PnP`'s `device_id`
+    /// empty, matching what a real recording can hit for a moment right after
+    /// `releaseUSBMicIfLive` clears it and `applyMicrophonePriority` rewrites it fresh), a
+    /// *different*, muted, zero-tracks source (`Macbook`) bled onto that track *and* onto
+    /// every other unassigned track — reproduced twice, and confirmed absent when the same 3
+    /// sources were reconfigured so the resolved-mic track had real signal instead. This looks
+    /// like a genuine OBS-internal multi-track audio mixer bug triggered by a silent/
+    /// not-yet-attached source, not anything wrong with the requests this app sends — and
+    /// there's no known websocket-reachable way to fix OBS's own mixer internals (same
+    /// category as this codebase's other documented un-fixable OBS quirks: RemoveInput/camera
+    /// stuck-open, SetSceneItemEnabled not stopping capture, etc.). Since tracks 4-6 were never
+    /// meant to carry anything a listener should trust anyway, the only real guarantee is to
+    /// not ship them — hence this unconditional strip rather than chasing the OBS-internal
+    /// trigger further. `applyMicrophonePriority`'s settle delay after rewriting `USB PnP`'s
+    /// device_id is a defense-in-depth reduction of how often the trigger condition occurs,
+    /// not a substitute for this.
+    ///
+    /// Not applied to Audio mode's output: `transcodeToMP3ThenRegister` already explicitly
+    /// selects `-map 0:a:0` (Track 1, the full mix) and discards every other stream, including
+    /// 4-6, so it was never exposed to this regardless.
+    ///
+    /// `-c copy` (stream copy, no re-encode) keeps this fast and lossless. Falls back to
+    /// registering the original file untouched — never silently loses the recording — if
+    /// ffmpeg isn't found or the remux fails for any reason.
+    nonisolated private static func stripUnusedAudioTracksAndRegister(path: String, mode: RecordingMode) {
+        Task.detached(priority: .utility) {
+            guard let ffmpegPath = resolveFFmpegPath() else {
+                NSLog("RecBar: ffmpeg not found — keeping all 6 audio tracks for \(path)")
+                LibraryStore.registerCompletedRecording(path: path, mode: mode)
+                return
+            }
+
+            let strippedPath = path + ".stripped.mov"
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: ffmpegPath)
+            process.arguments = [
+                "-y", "-hide_banner", "-loglevel", "error",
+                "-i", path,
+                "-map", "0:v", "-map", "0:a:0", "-map", "0:a:1", "-map", "0:a:2",
+                "-c", "copy", strippedPath
+            ]
+            process.standardOutput = FileHandle.nullDevice
+            let stderrPipe = Pipe()
+            process.standardError = stderrPipe
+
+            do {
+                try process.run()
+                // Read (and thereby drain) stderr before waitUntilExit() — avoids a classic
+                // Process+Pipe deadlock if ffmpeg writes enough to fill the pipe before exiting.
+                let stderrData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+                process.waitUntilExit()
+                guard process.terminationStatus == 0, FileManager.default.fileExists(atPath: strippedPath) else {
+                    let message = String(data: stderrData, encoding: .utf8) ?? ""
+                    NSLog("RecBar: track-strip remux failed (status \(process.terminationStatus)) — keeping all 6 tracks. ffmpeg said: \(message)")
+                    try? FileManager.default.removeItem(atPath: strippedPath)
+                    LibraryStore.registerCompletedRecording(path: path, mode: mode)
+                    return
+                }
+                _ = try FileManager.default.replaceItemAt(URL(fileURLWithPath: path), withItemAt: URL(fileURLWithPath: strippedPath))
+                LibraryStore.registerCompletedRecording(path: path, mode: mode)
+            } catch {
+                NSLog("RecBar: failed to launch ffmpeg for track-strip remux (\(error)) — keeping all 6 tracks")
+                try? FileManager.default.removeItem(atPath: strippedPath)
+                LibraryStore.registerCompletedRecording(path: path, mode: mode)
             }
         }
     }
