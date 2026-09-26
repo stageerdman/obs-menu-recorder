@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 
 @main
 struct RecBarApp: App {
@@ -15,29 +16,28 @@ struct RecBarApp: App {
         } label: {
             MenuBarIcon()
                 .environmentObject(appState)
+                // Left-click still opens the popover (MenuBarExtra's own behaviour); this only
+                // adds a right-click menu (Show / Quit) on top, since MenuBarExtra exposes no
+                // built-in way to do both. Additive by design — if the status button can't be
+                // found the right-click simply does nothing and left-click is unaffected.
+                .background(StatusItemRightClickMenu(appState: appState))
         }
         .menuBarExtraStyle(.window)
-
-        // A single-instance window (not WindowGroup, which would spawn a new instance on
-        // every openWindow(id:) call with no built-in dedup) listing every tracked recording
-        // across the 3 save folders — see LibraryView. Requires macOS 14 (Package.swift was
-        // bumped from .v13 for this Scene type specifically).
-        Window("Library", id: "library") {
-            LibraryView(appState: appState)
-        }
+        // The Library window is intentionally NOT a SwiftUI Window/WindowGroup scene — it's an
+        // AppKit NSWindow owned by LibraryWindowManager, so RecBar can toggle its Dock icon on
+        // (window open) and off (window closed) reliably. See LibraryWindowManager for why.
     }
 }
 
 private struct PopoverContent: View {
     @EnvironmentObject var appState: AppState
-    @Environment(\.openWindow) private var openWindow
 
     var body: some View {
         VStack(spacing: 0) {
             HStack {
                 Spacer()
                 Button {
-                    openWindow(id: "library")
+                    LibraryWindowManager.shared.show(appState: appState)
                 } label: {
                     Image(systemName: "rectangle.stack")
                         .font(.system(size: 12, weight: .semibold))
@@ -102,6 +102,79 @@ private struct MenuBarIcon: View {
         case .idle: return .primary
         case .recording: return RecBarColor.green
         case .paused: return RecBarColor.red
+        }
+    }
+}
+
+/// Adds a right-click menu (Show / Quit) to the MenuBarExtra's status-item button.
+///
+/// MenuBarExtra (`.window` style) owns the button's left-click to toggle the popover and gives
+/// no hook for a right-click menu, so we place this zero-size NSView inside the button (via
+/// `.background` on the label), walk up to the NSStatusBarButton it lives in, and attach a
+/// right-mouse-only click gesture recognizer that pops up an NSMenu. This is purely additive:
+/// it never touches the button's existing left-click action, and if the button can't be found
+/// the recogniser just isn't installed — left-click keeps working either way.
+private struct StatusItemRightClickMenu: NSViewRepresentable {
+    let appState: AppState
+
+    func makeCoordinator() -> Coordinator { Coordinator(appState: appState) }
+
+    func makeNSView(context: Context) -> NSView {
+        let view = NSView(frame: .zero)
+        context.coordinator.attach(to: view)
+        return view
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {}
+
+    @MainActor
+    final class Coordinator: NSObject {
+        private let appState: AppState
+        private let menu = NSMenu()
+
+        init(appState: AppState) {
+            self.appState = appState
+            super.init()
+            let show = NSMenuItem(title: "Show", action: #selector(showApp), keyEquivalent: "")
+            show.target = self
+            let quit = NSMenuItem(title: "Quit", action: #selector(quitApp), keyEquivalent: "q")
+            quit.target = self
+            menu.addItem(show)
+            menu.addItem(.separator())
+            menu.addItem(quit)
+        }
+
+        func attach(to view: NSView) {
+            // The view isn't in the window hierarchy yet during makeNSView, so defer the
+            // superview walk to the next runloop tick once it's been mounted inside the button.
+            DispatchQueue.main.async { [weak self, weak view] in
+                guard let self, let view else { return }
+                var candidate: NSView? = view.superview
+                while let current = candidate, !(current is NSButton) {
+                    candidate = current.superview
+                }
+                guard let button = candidate else { return }
+                let recognizer = NSClickGestureRecognizer(
+                    target: self, action: #selector(self.handleRightClick(_:)))
+                recognizer.buttonMask = 0x2 // secondary (right) button only
+                recognizer.numberOfClicksRequired = 1
+                button.addGestureRecognizer(recognizer)
+            }
+        }
+
+        @objc private func handleRightClick(_ sender: NSGestureRecognizer) {
+            guard let button = sender.view else { return }
+            menu.popUp(positioning: nil,
+                       at: NSPoint(x: 0, y: button.bounds.height + 4),
+                       in: button)
+        }
+
+        @objc private func showApp() {
+            LibraryWindowManager.shared.show(appState: appState)
+        }
+
+        @objc private func quitApp() {
+            NSApp.terminate(nil)
         }
     }
 }

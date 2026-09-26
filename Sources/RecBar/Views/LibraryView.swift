@@ -42,25 +42,10 @@ struct LibraryView: View {
             }
         }
         .frame(minWidth: 480, idealWidth: 560, minHeight: 360, idealHeight: 480)
-        .onAppear {
-            NSApp.setActivationPolicy(.regular)
-            NSApp.activate(ignoringOtherApps: true)
-            viewModel.start()
-        }
-        .onDisappear {
-            viewModel.stop()
-            // Returning to .accessory is what removes RecBar's Dock icon (leaving only the
-            // menu bar item). Applying it synchronously here — while the window is still
-            // mid-close and RecBar is still the frontmost/active app — leaves the Dock tile
-            // lingering: macOS won't drop it while the app is active in that same moment.
-            // Hopping to the next runloop tick lets the window finish closing and activation
-            // move on to another app first, so the tile actually disappears (real-usage
-            // report, 2026-09-26: closing the Library window with the red cross left RecBar
-            // stuck in the Dock).
-            DispatchQueue.main.async {
-                NSApp.setActivationPolicy(.accessory)
-            }
-        }
+        // Dock-icon / activation-policy toggling lives in LibraryWindowManager, which owns this
+        // window as an AppKit NSWindow — see that file. Here we only manage the view model.
+        .onAppear { viewModel.start() }
+        .onDisappear { viewModel.stop() }
         .sheet(item: $viewModel.signInPrompt) { device in
             OneDriveSignInView(device: device)
         }
