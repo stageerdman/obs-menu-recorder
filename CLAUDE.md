@@ -873,6 +873,25 @@ per-file OneDrive share link.
     Requires the Azure app registration to have **"Allow public client flows" enabled**, or
     device code flow fails outright (`AADSTS7000218`) since there's deliberately no client
     secret in this design (a public client's device-code/refresh tokens don't need one).
+    - **Refresh token must only be discarded on a *definitive* revoke, not any refresh
+      failure (2026-09-27, user report: "constantly wants me to sign up to onedrive… why
+      doesn't it just save it like before").** `validAccessToken()` originally called
+      `signOut()` (deleting the Keychain refresh token) on **any** non-200 from the token
+      endpoint — so a single transient blip during a refresh (a 5xx, a 429 throttle, or a
+      flaky-connection empty/malformed body) permanently wiped an otherwise-valid sign-in,
+      and since `runUpload` only pops the device-code sheet when `!auth.isSignedIn`, the very
+      next cloud-button click had to redo the whole sign-in — hence "constantly." Recordings
+      were never affected: they always save locally regardless of OneDrive. Fixed by only
+      calling `signOut()` when Microsoft explicitly returns `invalid_grant` or
+      `interaction_required` (the token genuinely needs re-auth); every other failure throws
+      the new `AuthError.refreshFailed` transient case, which **keeps** the refresh token so
+      the next retry silently reuses it (no re-prompt). MSA refresh tokens last ~90 days of
+      inactivity and auto-rotate on each use (`storeTokens` persists the rotated one), so one
+      sign-in now genuinely lasts a long time. **Caveat**: because the *old* buggy build had
+      already deleted the stored token, one more sign-in is needed on the first upload after
+      this fix; it should stick thereafter. Built + installed 2026-09-27; not yet re-confirmed
+      end-to-end (needs a real upload, then a later click after a network hiccup, to verify no
+      re-prompt) — see issues.txt.
   - `OneDriveClient`'s upload sequence, in order, is the mechanism behind "see the link
     immediately, then the real video replaces the placeholder without the link changing":
     (1) resolve/create `{oneDrive.rootFolderName}/{category}` folder, (2) `PUT` a tiny

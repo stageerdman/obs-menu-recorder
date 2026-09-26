@@ -6,6 +6,26 @@ environment, so anything needing a real click, a real OBS instance, or real
 audio hardware must be confirmed with the user (see CLAUDE.md "Testing notes").
 
 ## Needs end-to-end verification with the user
+- [ ] Menu-bar right-click menu (2026-09-26, IN PROGRESS — awaiting user confirmation):
+      right-clicking the RecBar menu-bar icon should show Show (opens the Library
+      window) + Quit (NSApp.terminate). Implemented additively via StatusItemRightClickMenu
+      in RecBarApp.swift — a zero-size NSView in the label's .background walks up to the
+      NSStatusBarButton and attaches a right-button NSClickGestureRecognizer that pops up an
+      NSMenu; left-click popover is untouched. Built + installed; NOT confirmed. Risk: the
+      superview walk or right-only gesture may not fire on the status button (can't GUI-test).
+      Safe failure mode: right-click does nothing, left-click still works. If it doesn't fire,
+      the fallback is to drop MenuBarExtra and manage the NSStatusItem manually via an
+      AppDelegate (full control of left/right click + reactive icon via NSHostingView).
+- [ ] Library window Dock icon (2026-09-26, IN PROGRESS — awaiting user confirmation):
+      the Dock icon must appear when the Library window opens and disappear when it
+      closes, leaving only the menu-bar icon. Reworked to own the window as an AppKit
+      NSWindow (LibraryWindowManager) driving .regular/.accessory from the window's own
+      open/windowWillClose, after SwiftUI Window-scene policy toggling failed 3 ways
+      (tile lingered / bounced / window wouldn't reopen — see CLAUDE.md). Built +
+      installed; NOT yet confirmed. Test: quit RecBar fully, relaunch, then
+      open → close (red cross) → reopen the Library and watch the Dock tile. If the
+      tile still lingers on close, the next thing to try is asserting .accessory on the
+      next runloop tick and/or yielding active status.
 - [ ] Captain Log mode: full walkthrough of a real recording (camera full-frame,
       no screen/desktop audio, mic priority resolves, file lands in
       ~/Documents/Recordings/Captain Log). Scene bootstrap verified; recording not.
@@ -27,6 +47,20 @@ audio hardware must be confirmed with the user (see CLAUDE.md "Testing notes").
 - [ ] Debug drawer ellipsis toggles freely both ways while actively recording.
 
 ## Recently fixed, needs confirmation on real hardware/connection
+- [ ] OneDrive nagging repeated sign-in on every cloud-button click (fix 2026-09-27, user
+      report "constantly wants me to sign up to onedrive… why doesn't it just save it like
+      before"): recordings always save locally regardless of OneDrive — that was never the
+      problem. Root cause: OneDriveAuth.validAccessToken() called signOut() (deleting the
+      Keychain refresh token) on ANY non-200 refresh response, so a single transient blip
+      (5xx / 429 / flaky-connection empty body) permanently wiped a working sign-in and the
+      next click had to redo the full device-code flow. Fixed: only signOut() on an explicit
+      invalid_grant / interaction_required (token genuinely dead); every other failure throws
+      a new .refreshFailed transient error that KEEPS the token so the next retry silently
+      reuses it. MSA refresh tokens live ~90 days and auto-rotate on use, so one sign-in now
+      lasts a long time. Built + installed to /Applications/RecBar.app. Note: because the old
+      code already deleted the stored token, ONE more sign-in is needed next upload; after
+      that it should stick. Confirm: sign in once, then several later cloud-button clicks
+      (esp. after a network hiccup) no longer re-prompt.
 - [ ] OneDrive uploads still failing on large files (fix 2026-09-23, follow-up to a4a9947):
       the timeout bump wasn't enough — real library.json failures were all mid-upload
       NSURLError transients (network-connection-lost, cannot-parse-response, timed-out) that

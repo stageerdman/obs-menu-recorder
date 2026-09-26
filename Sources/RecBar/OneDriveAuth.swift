@@ -34,6 +34,7 @@ final class OneDriveAuth {
         case expired
         case declined
         case notSignedIn
+        case refreshFailed(String)
 
         var errorDescription: String? {
             switch self {
@@ -43,6 +44,7 @@ final class OneDriveAuth {
             case .expired: return "OneDrive sign-in code expired — try again."
             case .declined: return "OneDrive sign-in was declined."
             case .notSignedIn: return "Not signed in to OneDrive."
+            case .refreshFailed(let m): return "Couldn't reach OneDrive to refresh sign-in (still signed in — just retry): \(m)"
             }
         }
     }
@@ -147,14 +149,33 @@ final class OneDriveAuth {
         ])
 
         let (data, response) = try await URLSession.shared.data(for: request)
-        guard (response as? HTTPURLResponse)?.statusCode == 200,
-              let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
-            signOut() // refresh token revoked/expired — force a fresh sign-in next time
+        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+        let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+
+        if status == 200, let json {
+            try storeTokens(from: json)
+            guard let accessToken else { throw AuthError.notSignedIn }
+            return accessToken
+        }
+
+        // Only discard the saved sign-in when Microsoft explicitly says the refresh token
+        // itself is no longer usable — `invalid_grant` (revoked, aged out past its lifetime,
+        // consent removed) or `interaction_required` (the user genuinely must re-auth). These
+        // are the only cases where a fresh device-code sign-in is the actual remedy.
+        //
+        // Everything else — a 5xx, throttling (429), or a malformed/empty body from a flaky
+        // connection — is transient: keep the refresh token so the *next* retry silently
+        // reuses it instead of forcing another full sign-in. This is the whole reason sign-in
+        // used to be demanded "constantly": the old code called signOut() on ANY non-200, so a
+        // single network blip during a token refresh permanently wiped a working sign-in.
+        let errorCode = json?["error"] as? String
+        let mustReauth = errorCode == "invalid_grant" || errorCode == "interaction_required"
+        if mustReauth {
+            signOut()
             throw AuthError.notSignedIn
         }
-        try storeTokens(from: json)
-        guard let accessToken else { throw AuthError.notSignedIn }
-        return accessToken
+        throw AuthError.refreshFailed(
+            json?["error_description"] as? String ?? errorCode ?? "HTTP \(status)")
     }
 
     private func storeTokens(from json: [String: Any]) throws {
