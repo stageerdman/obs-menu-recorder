@@ -249,6 +249,27 @@ layout changed together, on explicit user request:
   change was needed for this: `Output`/`Mode` is `Simple`, but `SimpleOutput`/`RecTracks` is
   already `63` (all 6 tracks recorded into the `hybrid_mov` file regardless) — so this was
   purely a per-source routing change, not a recording-pipeline change.
+  - **The `Screen` source leaked desktop audio onto track 2, root cause confirmed live
+    (2026-10-02).** User report: track 2 ("mic only") was audibly a *mix* — you could hear the
+    far end faintly. Forensics on real saved files (`ffmpeg` per-track cross-correlation in a
+    scratch Python script, not committed) measured an exact, reproducible `track2 = mic +
+    0.5·desktop`, `track1 = mic + desktop(×2)`, `track3 = desktop(×2)` at **zero lag** (digital,
+    not acoustic). A live `GetInputAudioTracks` probe during a real recording found the cause:
+    the **`Screen` source (macOS `screen_capture`) also captures system/application audio and,
+    left at OBS's default, was routed to all six tracks** — so it dumped desktop audio onto
+    track 2 (and double-captured it into the mix, hence the ×2/0.5 ratios). `applyAudioTrackRouting`
+    had never constrained `Screen`; every *other* source's live mask was already correct
+    (`USB PnP`→[1,2], `Desktop Sounds`→[1,3], `Macbook`/`Headphones Mic`→[]). Fixed by routing
+    `config.screenRelease.inputName` to **no tracks** (`enabledTracks: []`, gated on
+    `includeScreen = mode != .captainLog`, since Captain Log has no Screen source) — the same
+    mechanism that already makes the muted mics contribute zero audio. This fixes track 2 *at
+    the source* (truly clean mic, no post-processing), because post-hoc subtraction of track 3
+    can't be clean: each track is AAC-encoded separately, so even sample-identical desktop
+    bleed leaves voice-shaped quantization-noise residual that a scalar/filter subtraction
+    can't remove (the user had already hit exactly this with a prior subtraction attempt). Not
+    yet confirmed on a post-fix recording — needs the next real Meetings/Audio/Guide capture
+    (expect `corr(track2, track3) ≈ 0`); the pre-fix diagnosis is solid and the fix mirrors
+    proven routing.
 - **Audio mode transcodes to mp3-only** (`AppState.transcodeToMP3ThenRegister`, called from
   `stop(discard:)` in place of the ordinary `LibraryStore.registerCompletedRecording` call,
   only for `.other`/"Audio"): shells out to `ffmpeg` (`-vn -acodec libmp3lame -q:a 2` —

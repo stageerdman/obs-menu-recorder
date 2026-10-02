@@ -40,6 +40,13 @@ audio hardware must be confirmed with the user (see CLAUDE.md "Testing notes").
       top + enabled, but framing not separately confirmed).
 - [ ] Audio track split: confirm Track 1 = full mix, Track 2 = mic-only,
       Track 3 = desktop-only in a real saved file (ffmpeg -i file.mov).
+      Update (2026-10-02): track 2 was NOT mic-only — the `Screen` source (macOS
+      screen_capture) also captures system audio and was routed to all 6 tracks,
+      leaking desktop onto track 2 (measured track2 = mic + 0.5*desktop, zero-lag;
+      desktop also double-captured into the mix). Root-caused live via GetInputAudioTracks.
+      Fixed: applyAudioTrackRouting now routes `Screen` to no tracks. Built + installed.
+      CONFIRM on the next real Meetings/Audio/Guide recording that track 2 is clean
+      (expect corr(track2,track3) ~ 0 via ffmpeg cross-correlation).
 - [ ] Library: rename and "Move to Folder…" (drag-out-to-Finder is confirmed working).
 - [ ] USB mic release at idle: real unplug/replug or stop-then-check the macOS
       mic-in-use menu bar dot actually clears.

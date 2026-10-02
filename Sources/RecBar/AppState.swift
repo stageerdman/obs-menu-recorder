@@ -274,7 +274,9 @@ final class AppState: ObservableObject {
         // Meetings/Audio actually restore.
         let includeDesktopAudio = mode != .captainLog
         try await applyMicrophonePriority(resolved, includeDesktopAudio: includeDesktopAudio)
-        try await applyAudioTrackRouting(resolved, includeDesktopAudio: includeDesktopAudio)
+        // includeScreen mirrors the `mode != .captainLog` gate that restores the Screen source
+        // above — Captain Log is camera-only and has no Screen source to route.
+        try await applyAudioTrackRouting(resolved, includeDesktopAudio: includeDesktopAudio, includeScreen: mode != .captainLog)
         try await obs.startRecord()
 
         let started = await waitForEvent("RecordStateChanged", timeout: 5) { data in
@@ -341,9 +343,18 @@ final class AppState: ObservableObject {
     /// regardless of per-source routing), so this only needed to change *which* sources feed
     /// which tracks, not how many tracks get muxed into the output file.
     ///
-    /// `includeDesktopAudio` is false only for Captain Log, which never restores that source
-    /// at all (see beginRecording) — routing tracks for a nonexistent input would fail.
-    private func applyAudioTrackRouting(_ resolved: ResolvedMic, includeDesktopAudio: Bool) async throws {
+    /// `includeDesktopAudio`/`includeScreen` are false only for Captain Log, which never restores
+    /// those sources at all (see beginRecording) — routing tracks for a nonexistent input would fail.
+    ///
+    /// The `Screen` source (macOS `screen_capture`) must be routed to **no** tracks: it captures
+    /// system/application audio in addition to video and, left at OBS's default, routes that audio
+    /// to **all six** tracks. That dumped desktop audio onto track 2 (meant to be mic-only) and
+    /// double-captured it into the mix — confirmed live via `GetInputAudioTracks` (2026-10-02):
+    /// `Screen` showed tracks [1-6] while every other source was correctly scoped, and the saved
+    /// file measured exactly `track2 = mic + 0.5·desktop` / `track1 = mic + desktop(×2)`. Clearing
+    /// its tracks makes desktop audio come solely from `Desktop Sounds` ([1,3]) so track 2 is a
+    /// genuinely clean mic-only track (no post-processing/subtraction needed).
+    private func applyAudioTrackRouting(_ resolved: ResolvedMic, includeDesktopAudio: Bool, includeScreen: Bool) async throws {
         let sources = config.sources
         let resolvedMicName = resolved.role == .usb ? sources.micUSBSourceName : sources.micBuiltInSourceName
         let otherMicName = resolved.role == .usb ? sources.micBuiltInSourceName : sources.micUSBSourceName
@@ -354,6 +365,9 @@ final class AppState: ObservableObject {
         }
         try await obs.setInputAudioTracks(inputName: otherMicName, enabledTracks: [])
         try await obs.setInputAudioTracks(inputName: sources.micWiredSourceName, enabledTracks: [])
+        if includeScreen {
+            try await obs.setInputAudioTracks(inputName: config.screenRelease.inputName, enabledTracks: [])
+        }
     }
 
     // MARK: - Idle resource minimization
