@@ -27,8 +27,8 @@ final class LibraryViewModel: ObservableObject {
     }
 
     func start() {
-        recoverInterruptedUploads()
         reconcile()
+        resumeInterruptedUploads()
         guard timer == nil else { return }
         let timer = Timer(timeInterval: 4, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.reconcile() }
@@ -42,24 +42,38 @@ final class LibraryViewModel: ObservableObject {
         timer = nil
     }
 
-    /// Any recording persisted as mid-upload (`.creatingLink`/`.uploading`) can only have
-    /// gotten there in a *previous* app session: an in-flight upload lives entirely in an
-    /// in-memory `Task` (`uploadTasks`) that can't survive a relaunch or a quit-mid-upload, and
-    /// `OneDriveClient` restarts from byte 0 rather than resuming (see its doc comment). Left
-    /// as-is, such an entry is permanently stuck — the cloud control shows only a dead progress
-    /// bar with no retry, `startCloudUpload` refuses any non-`.none`/`.failed` state, and
-    /// rename/move/delete are all disabled while it reads as "uploading" (real-usage
-    /// stuck-upload report, 2026-09-22). So on launch, demote them to `.failed`: that surfaces
-    /// the retry button and unblocks the row's other actions. Any placeholder+link already
-    /// created is preserved (`cloudItemId`/`cloudWebUrl` untouched) so the retry reuses it —
-    /// see `runUpload`.
-    private func recoverInterruptedUploads() {
-        for item in LibraryStore.load()
+    /// Any recording persisted as mid-upload (`.creatingLink`/`.uploading`) can only have gotten
+    /// there in a *previous* app session — an in-flight upload lives in an in-memory `Task`
+    /// (`uploadTasks`) that can't survive a relaunch or a quit/crash/computer-restart mid-upload.
+    /// Rather than giving up on it, automatically pick it back up on launch: `runUpload` reuses
+    /// the persisted upload session (`cloudUploadUrl`) and `OneDriveClient.uploadFile` resumes
+    /// from the byte OneDrive last received, so progress genuinely survives a restart (and falls
+    /// back to restarting from byte 0 only if the server-side session has expired). Any
+    /// placeholder+link already created (`cloudItemId`/`cloudWebUrl`) is preserved so the same
+    /// share link stays valid. Called after `reconcile()` so `items` is populated first — the
+    /// resume Task reads the entry out of `items` (see `runUpload`).
+    ///
+    /// The one unresumable case is a local file that's since gone missing: nothing to upload, so
+    /// surface it as `.failed` (which unblocks the row's rename/move/delete and shows a retry).
+    private func resumeInterruptedUploads() {
+        for item in items
         where item.cloudUploadState == .uploading || item.cloudUploadState == .creatingLink {
-            var recovered = item
-            recovered.cloudUploadState = .failed
-            recovered.cloudErrorMessage = "Upload interrupted — click to retry"
-            LibraryStore.update(recovered)
+            // Don't disturb an upload already running in this session — `start()` re-runs every
+            // time the Library window is reopened, but the live `Task` (and its progress) persist
+            // in this `@StateObject` across close/reopen. Only pick up genuinely orphaned ones.
+            guard uploadTasks[item.id] == nil else { continue }
+            guard let path = item.lastKnownLocalPath,
+                  FileManager.default.fileExists(atPath: path) else {
+                var failed = item
+                failed.cloudUploadState = .failed
+                failed.cloudErrorMessage = "Upload interrupted and the local file is missing."
+                updateItem(failed)
+                continue
+            }
+            uploadTasks[item.id]?.cancel()
+            uploadTasks[item.id] = Task { [weak self] in
+                await self?.runUpload(itemId: item.id, localPath: path)
+            }
         }
     }
 
@@ -215,6 +229,7 @@ final class LibraryViewModel: ObservableObject {
                     current.cloudWebUrl = nil
                     current.cloudBytesSent = 0
                     current.cloudErrorMessage = nil
+                    current.cloudUploadUrl = nil
                     if current.lastKnownLocalPath == nil {
                         self.items.removeAll { $0.id == item.id }
                         LibraryStore.remove(id: item.id)
@@ -291,11 +306,16 @@ final class LibraryViewModel: ObservableObject {
         current.cloudWebUrl = nil
         current.cloudBytesSent = 0
         current.cloudErrorMessage = nil
+        current.cloudUploadUrl = nil
         updateItem(current)
     }
 
     private func runUpload(itemId: UUID, localPath: String) async {
-        setState(itemId, .creatingLink)
+        guard let existing = items.first(where: { $0.id == itemId }) else { return }
+        // A resume already has its placeholder+link, so jump straight to `.uploading` rather than
+        // flashing `.creatingLink`; a fresh start still has to create the link first.
+        let resuming = existing.cloudItemId != nil && existing.cloudWebUrl != nil
+        setState(itemId, resuming ? .uploading : .creatingLink)
         do {
             if !auth.isSignedIn {
                 try await signIn()
@@ -304,10 +324,9 @@ final class LibraryViewModel: ObservableObject {
 
             let fileName = (localPath as NSString).lastPathComponent
             // Reuse the existing cloud item + link if one was already created (a retry, or an
-            // interrupted upload recovered on launch): `createUploadSession` is scoped to that
+            // interrupted upload resumed on launch): `createUploadSession` is scoped to that
             // same id, so the already-shown share link stays valid — rather than orphaning it
-            // and minting a fresh placeholder+link on every retry (see OneDriveClient.uploadFile's
-            // "restarts from byte 0 against the same existing item id" contract).
+            // and minting a fresh placeholder+link on every retry.
             let uploadItemId: String
             if let existingItemId = item.cloudItemId, item.cloudWebUrl != nil {
                 uploadItemId = existingItemId
@@ -324,16 +343,23 @@ final class LibraryViewModel: ObservableObject {
                 uploadItemId = created.itemId
             }
             item.cloudUploadState = .uploading
-            item.cloudBytesSent = 0
             item.cloudErrorMessage = nil
             updateItem(item)
 
-            try await client.uploadFile(itemId: uploadItemId, localPath: localPath, auth: auth) { [weak self] sent, _ in
-                Task { @MainActor in self?.updateProgress(itemId, sent: sent) }
-            }
+            try await client.uploadFile(
+                itemId: uploadItemId, localPath: localPath, auth: auth,
+                resumeUploadUrl: item.cloudUploadUrl,
+                onSession: { [weak self] url in
+                    Task { @MainActor in self?.persistUploadUrl(itemId, url: url) }
+                },
+                onProgress: { [weak self] sent, _ in
+                    Task { @MainActor in self?.updateProgress(itemId, sent: sent) }
+                }
+            )
 
             guard var finished = items.first(where: { $0.id == itemId }) else { return }
             finished.cloudUploadState = .uploaded
+            finished.cloudUploadUrl = nil // session consumed; nothing left to resume
             updateItem(finished)
         } catch {
             // A user-initiated cancel (see `cancelUpload`) cancels this task, which surfaces
@@ -359,13 +385,25 @@ final class LibraryViewModel: ObservableObject {
         updateItem(item)
     }
 
-    /// Chunk-level progress: updates the in-memory published list every chunk for a live
-    /// progress bar, but only persists to disk on state transitions (see `updateItem`) — a
-    /// resumed upload after relaunch restarts from scratch anyway (see OneDriveClient), so
-    /// per-chunk disk writes here would just be wasted IO.
+    /// Chunk-level progress: updates the in-memory published list for a live progress bar and
+    /// persists the byte count to disk each chunk, so a relaunch/restart can show roughly where
+    /// the upload left off before the resume's `nextExpectedRanges` query (the authoritative
+    /// offset) lands. The per-chunk disk write is cheap (8 MiB per write on a tiny JSON file) and
+    /// no longer "wasted" now that uploads actually resume. reconcile's `liveUploading` guard
+    /// still protects the smoothly-climbing in-memory bar from being stomped by a stale disk read.
     private func updateProgress(_ id: UUID, sent: Int64) {
         guard let index = items.firstIndex(where: { $0.id == id }) else { return }
         items[index].cloudBytesSent = sent
+        LibraryStore.update(items[index])
+    }
+
+    /// Persists the resumable upload-session URL the moment `OneDriveClient` creates one, so an
+    /// interruption at any point after this can resume from the server's next-expected byte
+    /// rather than starting the upload over (see `resumeInterruptedUploads`).
+    private func persistUploadUrl(_ id: UUID, url: String) {
+        guard var item = items.first(where: { $0.id == id }) else { return }
+        item.cloudUploadUrl = url
+        updateItem(item)
     }
 
     private func updateItem(_ item: RecordingMetadata) {

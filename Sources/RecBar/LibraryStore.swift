@@ -30,16 +30,24 @@ struct RecordingMetadata: Codable, Identifiable {
     var cloudWebUrl: String?
     var cloudBytesSent: Int64
     var cloudErrorMessage: String?
+    /// The Microsoft Graph resumable-upload-session URL for an in-progress upload, persisted so
+    /// an upload interrupted by a quit, a crash, or a full computer restart can pick up from the
+    /// byte the server last received instead of starting over — see `OneDriveClient.uploadFile`
+    /// and `LibraryViewModel.resumeInterruptedUploads`. nil when no upload is in flight (cleared
+    /// once the upload finishes, is cancelled, or the cloud copy is deleted).
+    var cloudUploadUrl: String?
 
     enum CodingKeys: String, CodingKey {
         case id, category, fileName, lastKnownLocalPath, sizeBytes, createdAtEpoch
         case cloudUploadState, cloudItemId, cloudWebUrl, cloudBytesSent, cloudErrorMessage
+        case cloudUploadUrl
     }
 
     init(id: UUID, category: RecordingMode, fileName: String, lastKnownLocalPath: String?,
          sizeBytes: Int64?, createdAtEpoch: Int, cloudUploadState: CloudUploadState = .none,
          cloudItemId: String? = nil, cloudWebUrl: String? = nil,
-         cloudBytesSent: Int64 = 0, cloudErrorMessage: String? = nil) {
+         cloudBytesSent: Int64 = 0, cloudErrorMessage: String? = nil,
+         cloudUploadUrl: String? = nil) {
         self.id = id
         self.category = category
         self.fileName = fileName
@@ -51,6 +59,7 @@ struct RecordingMetadata: Codable, Identifiable {
         self.cloudWebUrl = cloudWebUrl
         self.cloudBytesSent = cloudBytesSent
         self.cloudErrorMessage = cloudErrorMessage
+        self.cloudUploadUrl = cloudUploadUrl
     }
 
     /// Migration-safe decode, matching Config.swift's models — every field beyond the
@@ -68,6 +77,7 @@ struct RecordingMetadata: Codable, Identifiable {
         cloudWebUrl = try c.decodeIfPresent(String.self, forKey: .cloudWebUrl)
         cloudBytesSent = try c.decodeIfPresent(Int64.self, forKey: .cloudBytesSent) ?? 0
         cloudErrorMessage = try c.decodeIfPresent(String.self, forKey: .cloudErrorMessage)
+        cloudUploadUrl = try c.decodeIfPresent(String.self, forKey: .cloudUploadUrl)
     }
 }
 

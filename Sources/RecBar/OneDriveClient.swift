@@ -33,7 +33,7 @@ final class OneDriveClient {
     /// tolerates this many *consecutive* failures (reset to 0 on any success) before the whole
     /// upload gives up — enough to ride out a transient outage without masking a genuinely dead
     /// connection or an unrecoverable client error.
-    private static let maxChunkRetries = 5
+    private static let maxChunkRetries = 10
 
     /// Dedicated session rather than `URLSession.shared` specifically because of the chunk PUTs
     /// in `uploadFile`: shared's default `timeoutIntervalForRequest` is 60s, so any 8 MiB chunk
@@ -125,34 +125,41 @@ final class OneDriveClient {
     /// the session to the existing item (rather than creating a new one) is what keeps the
     /// same id, and therefore the sharing link already created for it, valid once this
     /// finishes. Reads via FileHandle so multi-GB recordings never load fully into memory.
-    /// Deliberately doesn't try to resume an interrupted upload across app relaunches (Graph's
-    /// upload-session validity window isn't something to bet on with confidence) — a relaunch
-    /// mid-upload just restarts this call from byte 0 against the same existing item id.
+    ///
+    /// Resumable across relaunches/restarts: pass the previously-persisted `resumeUploadUrl`
+    /// (from `RecordingMetadata.cloudUploadUrl`). If that session is still alive on the server,
+    /// the upload picks up from the byte OneDrive last received (`nextExpectedRanges`) instead
+    /// of starting over; if it's expired/gone, or none was given, a fresh session is created and
+    /// handed back via `onSession` so the caller can persist it immediately. A session that dies
+    /// *mid-upload* (404/410 on a chunk PUT) is likewise recreated on the fly rather than failing
+    /// the whole upload. Graph's upload-session URL is itself pre-authenticated and valid for a
+    /// few days, so a persisted one typically survives an overnight restart; when it doesn't, the
+    /// recreate path means the worst case is restarting from byte 0, never a permanent failure.
     func uploadFile(itemId: String, localPath: String, auth: OneDriveAuth,
+                     resumeUploadUrl: String?,
+                     onSession: @escaping (String) -> Void,
                      onProgress: @escaping (Int64, Int64) -> Void) async throws {
-        let token = try await auth.validAccessToken()
-        var sessionRequest = URLRequest(url: URL(string: "\(Self.base)/me/drive/items/\(itemId)/createUploadSession")!)
-        sessionRequest.httpMethod = "POST"
-        sessionRequest.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        sessionRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        sessionRequest.httpBody = try JSONSerialization.data(withJSONObject: [
-            "item": ["@microsoft.graph.conflictBehavior": "replace"]
-        ])
-        let (sessionData, sessionResponse) = try await session.data(for: sessionRequest)
-        guard (sessionResponse as? HTTPURLResponse)?.statusCode == 200,
-              let sessionJson = try? JSONSerialization.jsonObject(with: sessionData) as? [String: Any],
-              let uploadUrlString = sessionJson["uploadUrl"] as? String,
-              let uploadUrl = URL(string: uploadUrlString) else {
-            throw GraphError.requestFailed((sessionResponse as? HTTPURLResponse)?.statusCode ?? -1,
-                                            String(data: sessionData, encoding: .utf8) ?? "")
-        }
-
         let fileHandle = try FileHandle(forReadingFrom: URL(fileURLWithPath: localPath))
         defer { try? fileHandle.close() }
         let attrs = try? FileManager.default.attributesOfItem(atPath: localPath)
         let totalSize = (attrs?[.size] as? NSNumber)?.int64Value ?? 0
 
-        var offset: Int64 = 0
+        // Resolve a resumable upload session: reuse the persisted one (so progress survives a
+        // quit/restart) when it's still alive on the server, otherwise create a fresh one.
+        var uploadUrl: URL
+        var offset: Int64
+        if let resume = resumeUploadUrl, let resumeURL = URL(string: resume),
+           let serverOffset = await nextExpectedOffset(uploadUrl: resumeURL) {
+            uploadUrl = resumeURL
+            offset = serverOffset
+        } else {
+            let fresh = try await createUploadSession(itemId: itemId, auth: auth)
+            uploadUrl = fresh
+            offset = 0
+            onSession(fresh.absoluteString)
+        }
+        onProgress(offset, totalSize)
+
         var consecutiveFailures = 0
         while offset < totalSize {
             try Task.checkCancellation()
@@ -176,14 +183,25 @@ final class OneDriveClient {
             } catch {
                 // A cancel (user aborted the upload) must propagate, not be retried.
                 if Task.isCancelled { throw error }
-                // A 4xx other than 429 (throttling) is a genuine client error — bad token,
-                // deleted item, malformed request — that re-sending can't fix, so fail fast
-                // rather than burning the whole retry budget on it. Everything else (network
-                // drops/timeouts, 5xx, 429) is a transient worth retrying.
-                if case GraphError.requestFailed(let code, _) = error,
-                   (400...499).contains(code), code != 429 {
-                    throw error
+                if case GraphError.requestFailed(let code, _) = error {
+                    // The upload session expired/was dropped by the server mid-upload — recreate
+                    // it against the same item (which restarts the bytes) and keep going, rather
+                    // than failing the whole upload. Persist the new URL so a later resume uses it.
+                    if code == 404 || code == 410 {
+                        let fresh = try await createUploadSession(itemId: itemId, auth: auth)
+                        uploadUrl = fresh
+                        offset = 0
+                        consecutiveFailures = 0
+                        onSession(fresh.absoluteString)
+                        onProgress(offset, totalSize)
+                        continue
+                    }
+                    // Any other 4xx (except 429 throttling) is a genuine client error — bad
+                    // token, deleted item, malformed request — that re-sending can't fix, so fail
+                    // fast rather than burning the whole retry budget on it.
+                    if (400...499).contains(code), code != 429 { throw error }
                 }
+                // Everything else (network drops/timeouts, 5xx, 429) is a transient worth retrying.
                 consecutiveFailures += 1
                 if consecutiveFailures > Self.maxChunkRetries { throw error }
                 // Exponential backoff (capped at 30s), then resume from the byte OneDrive
@@ -197,6 +215,29 @@ final class OneDriveClient {
                 }
             }
         }
+    }
+
+    /// Opens a fresh resumable upload session scoped to the existing `itemId` (conflictBehavior
+    /// `replace`), returning its pre-authenticated upload URL. Scoping to the existing item is
+    /// what preserves the id/sharing-link already created for it once content replacement finishes.
+    private func createUploadSession(itemId: String, auth: OneDriveAuth) async throws -> URL {
+        let token = try await auth.validAccessToken()
+        var sessionRequest = URLRequest(url: URL(string: "\(Self.base)/me/drive/items/\(itemId)/createUploadSession")!)
+        sessionRequest.httpMethod = "POST"
+        sessionRequest.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        sessionRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        sessionRequest.httpBody = try JSONSerialization.data(withJSONObject: [
+            "item": ["@microsoft.graph.conflictBehavior": "replace"]
+        ])
+        let (sessionData, sessionResponse) = try await session.data(for: sessionRequest)
+        guard (sessionResponse as? HTTPURLResponse)?.statusCode == 200,
+              let sessionJson = try? JSONSerialization.jsonObject(with: sessionData) as? [String: Any],
+              let uploadUrlString = sessionJson["uploadUrl"] as? String,
+              let uploadUrl = URL(string: uploadUrlString) else {
+            throw GraphError.requestFailed((sessionResponse as? HTTPURLResponse)?.statusCode ?? -1,
+                                            String(data: sessionData, encoding: .utf8) ?? "")
+        }
+        return uploadUrl
     }
 
     /// Queries a resumable upload session for the next byte OneDrive still expects, so a retry
