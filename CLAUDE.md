@@ -923,10 +923,29 @@ per-file OneDrive share link.
     granularity) via `FileHandle` so multi-GB recordings never load fully into memory; scoping
     the session to the existing id is what's expected to preserve the same id/link once
     content-replacement finishes — this is the one Graph-behavior assumption in the whole
-    design that most needs confirming against a real account. An app relaunch mid-upload does
-    **not** attempt to resume the interrupted session (Graph's upload-session validity window
-    isn't something to bet on with confidence) — it just restarts `createUploadSession` from
-    byte 0 against the same item id next time the row's cloud button is retried.
+    design that most needs confirming against a real account.
+    - **Uploads are resumable across quit/crash/computer-restart (2026-10-05, explicit user
+      request — supersedes the earlier "does not attempt to resume" design, which threw away
+      all progress on any interruption and restarted from byte 0, so large files on a flaky/slow
+      upstream rarely finished). Branch `resumable-onedrive-uploads`, NOT yet merged/verified.**
+      The `createUploadSession` upload URL and per-chunk `cloudBytesSent` are now persisted to
+      `library.json` (new `RecordingMetadata.cloudUploadUrl`). `OneDriveClient.uploadFile` takes
+      `resumeUploadUrl:`/`onSession:`: it GETs the persisted session for the server's own
+      `nextExpectedRanges` and resumes from there; if the session is gone (GET non-200, or a
+      chunk PUT returns 404/410 mid-upload) it recreates one against the same item id (link
+      preserved) and continues rather than failing — so the **only** cost of an expired session
+      is restarting the bytes, never a permanently failed upload. The **server's**
+      `nextExpectedRanges` is the source of truth for the resume offset; persisted
+      `cloudBytesSent` is only for UI continuity until the first GET lands. Chunk retry budget
+      raised 5→10. On launch, `LibraryViewModel.resumeInterruptedUploads` (replacing the old
+      `recoverInterruptedUploads` demote-to-`.failed`) auto-restarts any `.uploading`/
+      `.creatingLink` entry whose local file still exists — guarded by `uploadTasks[id] == nil`
+      so reopening the Library window mid-upload doesn't cancel a live upload (the `@StateObject`
+      VM persists across window close/reopen), and run **after** `reconcile()` so `items` is
+      populated first (`runUpload` reads the entry from `items`). A local file gone missing is
+      the one unresumable case → `.failed`. Not yet verified end-to-end (no real OneDrive / GUI
+      automation here) — see `updates/2026-10-05 Resumable OneDrive Uploads - OPEN/` and
+      issues.txt for the walkthrough still owed.
   - **Delete/restore (2026-09-10, explicit user request — supersedes the earlier "no
     delete-from-cloud action" design note below).** A row's `…` menu now offers "Copy Link"
     (when `cloudWebUrl != nil`), "Delete Locally" (when a local copy exists), and "Delete from

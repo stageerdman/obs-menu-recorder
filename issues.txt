@@ -54,6 +54,21 @@ audio hardware must be confirmed with the user (see CLAUDE.md "Testing notes").
 - [ ] Debug drawer ellipsis toggles freely both ways while actively recording.
 
 ## Recently fixed, needs confirmation on real hardware/connection
+- [ ] OneDrive uploads now resumable across quit/crash/computer-restart (2026-10-05, user
+      report "can't we make it so that progress is always saved… and recovered even after I
+      restart a computer?"). Branch `resumable-onedrive-uploads` (NOT merged to main yet).
+      Previously ANY interruption threw away progress and restarted from byte 0. Now the Graph
+      upload-session URL (new RecordingMetadata.cloudUploadUrl) + per-chunk cloudBytesSent are
+      persisted to library.json; OneDriveClient.uploadFile takes resumeUploadUrl/onSession and
+      resumes from the server's nextExpectedRanges, recreates a session on the fly if it died
+      mid-upload (404/410) instead of failing, retry budget 5->10. On launch,
+      LibraryViewModel.resumeInterruptedUploads auto-restarts any .uploading/.creatingLink
+      entry whose local file still exists (replacing the old demote-to-failed recovery).
+      Builds clean; NOT verified end-to-end (see updates/2026-10-05 … Phase 3). CONFIRM:
+      start a large upload, quit/restart partway, reopen Library → it resumes (bar not back to
+      0) and finishes; share link unchanged after completion.
+    - Caveat: if the server session has expired (multi-day), resume GET 404s and it restarts
+      from byte 0 against the same item id (link preserved) — graceful fallback, not a failure.
 - [ ] OneDrive nagging repeated sign-in on every cloud-button click (fix 2026-09-27, user
       report "constantly wants me to sign up to onedrive… why doesn't it just save it like
       before"): recordings always save locally regardless of OneDrive — that was never the
