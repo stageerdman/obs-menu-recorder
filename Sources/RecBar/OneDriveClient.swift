@@ -32,6 +32,21 @@ final class OneDriveClient {
         let state: String
     }
 
+    /// Who the signed-in OneDrive belongs to, read from the drive's `owner` facet — so the user
+    /// can see which account they're uploading into (and switch it if it's the wrong one).
+    struct DriveAccount {
+        let displayName: String
+        let email: String?
+    }
+
+    /// Quota + owning account, both off a single `GET /me/drive` — the drive response carries
+    /// both the `quota` and `owner` facets, so there's no need for a second round-trip (nor a
+    /// `/me` call, which would need the `User.Read` scope this app doesn't request).
+    struct DriveInfo {
+        let quota: DriveQuota
+        let account: DriveAccount
+    }
+
     private static let base = "https://graph.microsoft.com/v1.0"
     /// Each chunk must be a multiple of 320 KiB except the final one — 8 MiB is comfortably
     /// inside that requirement and keeps memory flat for multi-GB recordings via FileHandle.
@@ -269,10 +284,10 @@ final class OneDriveClient {
         return start
     }
 
-    /// Fetches the signed-in drive's storage quota (`GET /me/drive`, which returns the `quota`
-    /// facet alongside the drive metadata — no separate endpoint needed). Used to show how much
-    /// room is left on the OneDrive we upload into.
-    func getQuota(auth: OneDriveAuth) async throws -> DriveQuota {
+    /// Fetches the signed-in drive's storage quota and owning account in one `GET /me/drive` —
+    /// that response carries both the `quota` and `owner` facets. Used to show how much room is
+    /// left on the OneDrive we upload into, and which account it is.
+    func getDriveInfo(auth: OneDriveAuth) async throws -> DriveInfo {
         let token = try await auth.validAccessToken()
         var request = URLRequest(url: URL(string: "\(Self.base)/me/drive")!)
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
@@ -286,11 +301,19 @@ final class OneDriveClient {
         func int64(_ key: String) -> Int64 {
             (quota[key] as? NSNumber)?.int64Value ?? 0
         }
-        return DriveQuota(
-            total: int64("total"),
-            used: int64("used"),
-            remaining: int64("remaining"),
-            state: quota["state"] as? String ?? "normal"
+        let user = (json["owner"] as? [String: Any])?["user"] as? [String: Any]
+        let account = DriveAccount(
+            displayName: user?["displayName"] as? String ?? "OneDrive",
+            email: user?["email"] as? String
+        )
+        return DriveInfo(
+            quota: DriveQuota(
+                total: int64("total"),
+                used: int64("used"),
+                remaining: int64("remaining"),
+                state: quota["state"] as? String ?? "normal"
+            ),
+            account: account
         )
     }
 

@@ -63,8 +63,8 @@ struct LibraryView: View {
         HStack {
             Text("Library").font(.headline)
             Spacer()
-            if let quota = viewModel.quota {
-                OneDriveQuotaView(quota: quota)
+            if viewModel.isCloudConfigured {
+                OneDriveStatusMenu(viewModel: viewModel)
             }
             Button {
                 viewModel.reconcile()
@@ -293,6 +293,40 @@ private struct RecordingRow: View {
     private func copyLink(_ url: String) {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(url, forType: .string)
+    }
+}
+
+/// The clickable OneDrive status control in the Library header: shows the storage meter when
+/// signed in (or a plain cloud icon while the account is loading / signed out), and opens a menu
+/// to see which account is signed in and switch or sign out of it.
+private struct OneDriveStatusMenu: View {
+    @ObservedObject var viewModel: LibraryViewModel
+
+    var body: some View {
+        Menu {
+            if viewModel.isSignedIn {
+                if let account = viewModel.account {
+                    Section("Signed in to OneDrive") {
+                        Text(account.email ?? account.displayName)
+                    }
+                }
+                Button("Switch Account…") { viewModel.switchCloudAccount() }
+                Button("Sign Out") { viewModel.signOutOfCloud() }
+            } else {
+                Button("Sign In to OneDrive…") { viewModel.signInToCloud() }
+            }
+        } label: {
+            if let quota = viewModel.quota {
+                OneDriveQuotaView(quota: quota)
+            } else {
+                Image(systemName: viewModel.isSignedIn ? "cloud" : "cloud.slash")
+                    .foregroundStyle(.secondary)
+                    .help(viewModel.isSignedIn ? "OneDrive" : "Not signed in to OneDrive")
+            }
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
     }
 }
 

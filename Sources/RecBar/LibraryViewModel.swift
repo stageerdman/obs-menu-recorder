@@ -13,8 +13,14 @@ import Combine
 final class LibraryViewModel: ObservableObject {
     @Published private(set) var items: [RecordingMetadata] = []
     @Published private(set) var quota: OneDriveClient.DriveQuota?
+    @Published private(set) var account: OneDriveClient.DriveAccount?
+    @Published private(set) var isSignedIn = false
     @Published var signInPrompt: DeviceCodeResponse?
     @Published var signInError: String?
+
+    /// Whether OneDrive is usable at all — an empty `clientId` means there's no app registration
+    /// configured, so the cloud menu shows a "set clientId" hint rather than sign-in controls.
+    var isCloudConfigured: Bool { !config.oneDrive.clientId.isEmpty }
 
     private let config: RecBarConfig
     private let auth = OneDriveAuth()
@@ -280,16 +286,63 @@ final class LibraryViewModel: ObservableObject {
     /// quota reading just stays stale) rather than surfaced as an error; this is ambient info,
     /// not an action the user is waiting on.
     func refreshQuota() {
-        guard !config.oneDrive.clientId.isEmpty, auth.isSignedIn else { return }
+        isSignedIn = auth.isSignedIn
+        guard isCloudConfigured, auth.isSignedIn else {
+            quota = nil
+            account = nil
+            return
+        }
         Task { [weak self] in
             guard let self else { return }
             do {
-                let quota = try await self.client.getQuota(auth: self.auth)
-                await MainActor.run { self.quota = quota }
+                let info = try await self.client.getDriveInfo(auth: self.auth)
+                await MainActor.run {
+                    self.quota = info.quota
+                    self.account = info.account
+                }
             } catch {
-                NSLog("RecBar: failed to fetch OneDrive quota: \(error)")
+                NSLog("RecBar: failed to fetch OneDrive drive info: \(error)")
             }
         }
+    }
+
+    /// Signs out of the current OneDrive account (drops the stored refresh token) and clears the
+    /// cached quota/account so the UI reflects it immediately. Existing recordings and their
+    /// already-created share links are untouched — this only forgets the credential.
+    func signOutOfCloud() {
+        auth.signOut()
+        isSignedIn = false
+        quota = nil
+        account = nil
+    }
+
+    /// Starts an interactive device-code sign-in (the same sheet an upload triggers), then
+    /// refreshes the account/quota once it completes. Used by the "Sign In" menu action so the
+    /// user can sign in from the Library without having to kick off an upload first.
+    func signInToCloud() {
+        guard isCloudConfigured else {
+            signInError = "Set oneDrive.clientId in config.json first — see README for setup steps."
+            return
+        }
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                try await self.signIn()
+                self.refreshQuota()
+            } catch {
+                if Task.isCancelled { return }
+                self.signInError = "OneDrive sign-in failed: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    /// Switches which OneDrive account recordings upload into: forgets the current credential,
+    /// then immediately starts a fresh sign-in so the user can pick a different account. The
+    /// Microsoft sign-in page may still remember the old account — signing out there, or picking
+    /// "Use another account", is what actually changes it.
+    func switchCloudAccount() {
+        signOutOfCloud()
+        signInToCloud()
     }
 
     // MARK: - Cloud upload
