@@ -63,8 +63,12 @@ struct LibraryView: View {
         HStack {
             Text("Library").font(.headline)
             Spacer()
+            if let quota = viewModel.quota {
+                OneDriveQuotaView(quota: quota)
+            }
             Button {
                 viewModel.reconcile()
+                viewModel.refreshQuota()
             } label: {
                 Image(systemName: "arrow.clockwise")
             }
@@ -289,6 +293,58 @@ private struct RecordingRow: View {
     private func copyLink(_ url: String) {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(url, forType: .string)
+    }
+}
+
+/// A compact storage meter for the signed-in OneDrive, shown in the Library header: a thin
+/// used-fraction bar plus a "X free of Y" caption. The bar tints amber/red as Graph's own
+/// quota `state` moves from `normal` → `nearing` → `critical`/`exceeded`, so the user gets a
+/// heads-up before an upload would run out of room rather than only after it fails.
+private struct OneDriveQuotaView: View {
+    let quota: OneDriveClient.DriveQuota
+
+    private var usedFraction: Double {
+        guard quota.total > 0 else { return 0 }
+        return min(max(Double(quota.used) / Double(quota.total), 0), 1)
+    }
+
+    private var barColor: Color {
+        switch quota.state {
+        case "critical", "exceeded": return RecBarColor.red
+        case "nearing": return .orange
+        default: return .secondary
+        }
+    }
+
+    private static let formatter: ByteCountFormatter = {
+        let f = ByteCountFormatter()
+        f.countStyle = .binary
+        f.allowedUnits = [.useGB, .useTB, .useMB]
+        return f
+    }()
+
+    private func label(_ bytes: Int64) -> String {
+        Self.formatter.string(fromByteCount: max(bytes, 0))
+    }
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "cloud")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            GeometryReader { geo in
+                ZStack(alignment: .leading) {
+                    Capsule().fill(Color.secondary.opacity(0.2))
+                    Capsule().fill(barColor)
+                        .frame(width: geo.size.width * usedFraction)
+                }
+            }
+            .frame(width: 70, height: 5)
+            Text("\(label(quota.remaining)) free of \(label(quota.total))")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+        }
+        .help("OneDrive: \(label(quota.used)) used of \(label(quota.total))")
     }
 }
 

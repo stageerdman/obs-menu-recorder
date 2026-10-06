@@ -21,6 +21,17 @@ final class OneDriveClient {
         }
     }
 
+    /// The storage picture for the signed-in OneDrive, straight off the drive's `quota` facet.
+    /// `total`/`used`/`remaining` are bytes; `state` is Graph's own word for how close to full
+    /// it is (`normal`, `nearing`, `critical`, `exceeded`) — surfaced so the UI can warn before
+    /// an upload would fail for lack of room rather than only after.
+    struct DriveQuota {
+        let total: Int64
+        let used: Int64
+        let remaining: Int64
+        let state: String
+    }
+
     private static let base = "https://graph.microsoft.com/v1.0"
     /// Each chunk must be a multiple of 320 KiB except the final one — 8 MiB is comfortably
     /// inside that requirement and keeps memory flat for multi-GB recordings via FileHandle.
@@ -256,6 +267,31 @@ final class OneDriveClient {
             return nil
         }
         return start
+    }
+
+    /// Fetches the signed-in drive's storage quota (`GET /me/drive`, which returns the `quota`
+    /// facet alongside the drive metadata — no separate endpoint needed). Used to show how much
+    /// room is left on the OneDrive we upload into.
+    func getQuota(auth: OneDriveAuth) async throws -> DriveQuota {
+        let token = try await auth.validAccessToken()
+        var request = URLRequest(url: URL(string: "\(Self.base)/me/drive")!)
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        let (data, response) = try await session.data(for: request)
+        guard (response as? HTTPURLResponse)?.statusCode == 200,
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let quota = json["quota"] as? [String: Any] else {
+            throw GraphError.requestFailed((response as? HTTPURLResponse)?.statusCode ?? -1,
+                                            String(data: data, encoding: .utf8) ?? "")
+        }
+        func int64(_ key: String) -> Int64 {
+            (quota[key] as? NSNumber)?.int64Value ?? 0
+        }
+        return DriveQuota(
+            total: int64("total"),
+            used: int64("used"),
+            remaining: int64("remaining"),
+            state: quota["state"] as? String ?? "normal"
+        )
     }
 
     func rename(itemId: String, newName: String, auth: OneDriveAuth) async throws {

@@ -12,6 +12,7 @@ import Combine
 @MainActor
 final class LibraryViewModel: ObservableObject {
     @Published private(set) var items: [RecordingMetadata] = []
+    @Published private(set) var quota: OneDriveClient.DriveQuota?
     @Published var signInPrompt: DeviceCodeResponse?
     @Published var signInError: String?
 
@@ -29,6 +30,7 @@ final class LibraryViewModel: ObservableObject {
     func start() {
         reconcile()
         resumeInterruptedUploads()
+        refreshQuota()
         guard timer == nil else { return }
         let timer = Timer(timeInterval: 4, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.reconcile() }
@@ -236,6 +238,7 @@ final class LibraryViewModel: ObservableObject {
                     } else {
                         self.updateItem(current)
                     }
+                    self.refreshQuota() // bytes freed on the cloud — update free space
                 }
             } catch {
                 NSLog("RecBar: failed to delete cloud item \(itemId): \(error)")
@@ -264,6 +267,27 @@ final class LibraryViewModel: ObservableObject {
             } catch {
                 NSLog("RecBar: failed to restore \(item.fileName) from OneDrive: \(error)")
                 await MainActor.run { self.signInError = "Failed to restore from OneDrive: \(error.localizedDescription)" }
+            }
+        }
+    }
+
+    // MARK: - Cloud quota
+
+    /// Refreshes the signed-in OneDrive's storage picture. Only runs when there's actually a
+    /// usable sign-in (clientId configured + a stored refresh token) — otherwise it would either
+    /// fail immediately or, worse, pop a device-code sign-in sheet just from opening the Library,
+    /// which the user never asked for. Transient failures are swallowed quietly (the existing
+    /// quota reading just stays stale) rather than surfaced as an error; this is ambient info,
+    /// not an action the user is waiting on.
+    func refreshQuota() {
+        guard !config.oneDrive.clientId.isEmpty, auth.isSignedIn else { return }
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                let quota = try await self.client.getQuota(auth: self.auth)
+                await MainActor.run { self.quota = quota }
+            } catch {
+                NSLog("RecBar: failed to fetch OneDrive quota: \(error)")
             }
         }
     }
@@ -361,6 +385,8 @@ final class LibraryViewModel: ObservableObject {
             finished.cloudUploadState = .uploaded
             finished.cloudUploadUrl = nil // session consumed; nothing left to resume
             updateItem(finished)
+            refreshQuota() // a whole recording's worth of bytes just landed — update free space
+
         } catch {
             // A user-initiated cancel (see `cancelUpload`) cancels this task, which surfaces
             // here as a thrown error — but cancelUpload already reset the entry to `.none`, so
