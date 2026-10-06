@@ -970,6 +970,35 @@ per-file OneDrive share link.
     `decodeIfPresent(...) ?? default` pattern as every other field added to this struct — an
     empty `clientId` makes the Library window's cloud button surface a clear "set
     oneDrive.clientId in config.json first" message rather than failing silently.
+  - **Storage-quota + account tracking in the Library header (2026-10-06, explicit user
+    request — confirmed showing correctly for the signed-in account; account-switch round-trip
+    not yet re-confirmed).** `OneDriveClient.getDriveInfo(auth:)` does a single
+    `GET /me/drive`, whose response carries **both** the `quota` facet (`total`/`used`/
+    `remaining`/`state`, returned as `DriveQuota`) and the `owner` facet (returned as
+    `DriveAccount` = `displayName` + optional `email`) — so account identity costs no extra
+    request and, crucially, **no extra OAuth scope** (a `/me` call would need `User.Read`,
+    which this app deliberately doesn't request; the drive owner comes free with the existing
+    `Files.ReadWrite` scope). `LibraryViewModel` publishes `quota`/`account`/`isSignedIn` and
+    exposes `refreshQuota()` (fetches both), `signOutOfCloud()`, `signInToCloud()` (starts the
+    same device-code sheet an upload would, so you can sign in from the Library without first
+    kicking off an upload), and `switchCloudAccount()` (= sign out then sign in). `refreshQuota`
+    is called on Library open, on the ⟳ refresh button, and after any upload completes / cloud
+    delete — the moments the number actually changes — **not** on the 4s reconcile timer (too
+    frequent, wasteful). It **only fetches when there's a usable sign-in** (`clientId` set +
+    stored refresh token), specifically so merely opening the Library never pops a device-code
+    sign-in sheet the user didn't ask for; transient fetch failures are logged and leave the
+    last reading stale rather than surfaced as an error (ambient info, not an action). UI:
+    `OneDriveStatusMenu` in `LibraryView.swift` — a `Menu` whose label is the storage meter
+    (`OneDriveQuotaView`: a thin used-fraction `Capsule` bar tinting `.secondary`→orange
+    (`nearing`)→`RecBarColor.red` (`critical`/`exceeded`) off Graph's own quota `state`, plus a
+    `ByteCountFormatter` "X free of Y" caption) when signed in, or a plain `cloud`/`cloud.slash`
+    icon while loading/signed-out; the menu shows the signed-in account and Switch/Sign Out, or
+    a Sign In action when signed out. The whole control is gated on
+    `LibraryViewModel.isCloudConfigured` (non-empty `clientId`). **Switch-account caveat**:
+    "Switch Account…" forgets RecBar's own credential and restarts the device-code flow, but
+    Microsoft's sign-in page often silently re-uses the previous account — the user must pick
+    "Use another account" there to actually change it; nothing RecBar can force from the
+    device-code flow's side.
 
 ## Build / install
 

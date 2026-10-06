@@ -58,6 +58,24 @@ Walk through with real OneDrive + a large recording:
 5. Edge: let a session go stale long enough to expire (multi-day), confirm the fallback
    restarts from byte 0 cleanly rather than erroring.
 
+## Side-work done on this branch (2026-10-06) — OneDrive quota + account UI
+
+Separate from resumable uploads but landed on the same branch (two commits):
+- **Storage-quota meter** in the Library header (user: "add tracking of available space on
+  onedrive we're uploading to"). `OneDriveClient.getDriveInfo` (GET /me/drive → quota + owner
+  facets); `LibraryViewModel` publishes `quota`/`account`/`isSignedIn`, `refreshQuota()` on
+  Library open / ⟳ / post-upload / post-cloud-delete (not on the 4s timer); `OneDriveQuotaView`
+  draws a used-fraction bar + "X free of Y". Only fetches when already signed in. **CONFIRMED
+  showing correctly by the user.**
+- **Account menu** (user: "see what [account] am I signed into and ability to switch it").
+  Clicking the meter → `OneDriveStatusMenu` shows the signed-in account + Switch Account /
+  Sign Out, or Sign In when signed out. Account from the drive `owner` facet (no extra scope).
+  Signed-in display confirmed; **Switch Account round-trip NOT yet re-confirmed** (Microsoft's
+  page may silently reuse the old account — must pick "Use another account"). See issues.txt.
+
+Note: these are shipped but the branch is still unmerged — whatever merges the resumable-uploads
+work to main will carry these too. Nothing blocks them.
+
 ## Open questions / caveats
 - Graph upload-session URLs are valid a few days — a persisted one usually survives an
   overnight restart, but if expired the resume GET 404s and we recreate (restart from 0,

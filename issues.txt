@@ -54,6 +54,21 @@ audio hardware must be confirmed with the user (see CLAUDE.md "Testing notes").
 - [ ] Debug drawer ellipsis toggles freely both ways while actively recording.
 
 ## Recently fixed, needs confirmation on real hardware/connection
+- [x] OneDrive storage-quota meter in the Library header (2026-10-06, user request "add
+      tracking of available space on onedrive we're uploading to") — CONFIRMED showing
+      correctly by the user. OneDriveClient.getDriveInfo (GET /me/drive → quota + owner facets,
+      no extra OAuth scope); LibraryViewModel publishes quota/account/isSignedIn + refreshQuota
+      (on Library open, ⟳ refresh, and after any upload/cloud-delete — NOT on the 4s reconcile
+      timer); OneDriveStatusMenu/OneDriveQuotaView draw a used-fraction bar (amber/red on
+      Graph's quota `state`) + "X free of Y". Only fetches when already signed in so opening the
+      Library never pops a sign-in sheet. Branch resumable-onedrive-uploads (same branch as the
+      resumable work; NOT merged to main yet).
+- [ ] OneDrive account menu: click the meter → see signed-in account, Switch Account / Sign Out,
+      or Sign In when signed out (2026-10-06, user request "see what [account] am I signed into
+      and ability to switch it"). Account name/email from the drive `owner` facet. Signed-in
+      display confirmed working; STILL TO CONFIRM: the Switch Account round-trip actually lands
+      on a different account (Microsoft's sign-in page may silently reuse the old one — user
+      must pick "Use another account" there), and Sign Out → Sign In from the Library header.
 - [ ] OneDrive uploads now resumable across quit/crash/computer-restart (2026-10-05, user
       report "can't we make it so that progress is always saved… and recovered even after I
       restart a computer?"). Branch `resumable-onedrive-uploads` (NOT merged to main yet).
