@@ -18,13 +18,17 @@ audio hardware must be confirmed with the user (see CLAUDE.md "Testing notes").
       loopback server binds the exact port + path from oneDrive.redirectUri. RecBar's app
       (clientId bae96960-…, DIFFERENT from Pensieve's 51c918-…) is a PUBLIC client (worked with
       device-code + no secret), so clientSecret stays empty (optional safety-net field, sent
-      only if non-empty). Redirect URI must be one registered on bae96960: user confirmed
-      :3000/api/auth/callback is there, then asked to switch to :8711/callback (set 2026-10-09).
-      CAVEAT: 8711 only works if it's ALSO registered on bae96960 — else AADSTS50011 (redirect
-      mismatch); fall back to :3000. Build green; NOT walked live — confirm: Sign In opens the
-      browser, approving closes the sheet on its own, account/quota populate, and a real upload
-      still works. Also confirm Cancel closes the sheet with no stuck listener, and that the
-      bound port being free is required (clear error if something else holds it).
+      only if non-empty). Redirect URI must be one registered on bae96960. config.json
+      oneDrive.redirectUri is set to http://localhost:8711/callback, and the user registered
+      that exact URI on RecBar's app bae96960 (2026-10-09). RecBar relaunched with the new
+      config; port 8711 free. STILL NOT WALKED LIVE: the sign-in click + browser round-trip was
+      not done before we stopped. NEXT: Library -> cloud menu -> Sign In -> approve in browser
+      -> expect the "signed in" close page, the sheet to self-dismiss, account/quota to
+      populate; then one real upload end to end. Error map: AADSTS50011 = 8711 not matching on
+      bae96960 (recheck Azure / use :3000); AADSTS7000218 = added under "Web" not "Mobile and
+      desktop" (re-add under Mobile-and-desktop, or set oneDrive.clientSecret). Also confirm
+      Cancel closes the sheet with no stuck listener. Full resume point in
+      updates/2026-10-09 OneDrive Loopback Sign-In - OPEN/update v1.md.
 - [ ] Menu-bar right-click menu (2026-09-26, IN PROGRESS — awaiting user confirmation):
       right-clicking the RecBar menu-bar icon should show Show (opens the Library
       window) + Quit (NSApp.terminate). Implemented additively via StatusItemRightClickMenu
