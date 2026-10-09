@@ -35,24 +35,27 @@ Authorization-code flow with **PKCE**, **public client** (no client secret — s
 - `Sources/RecBar/Views/LibraryView.swift` — the code sheet → a lightweight "finishing in your
   browser" sheet with a Cancel button.
 
-## Azure / config (updated after the user confirmed their registration)
-The user already has `http://localhost:3000/api/auth/callback` registered (the **Pensieve**
-project's Web-platform redirect). Microsoft matches `redirect_uri` by exact string, so:
-- The loopback server binds the **exact** port (3000) + path (`/api/auth/callback`) from
-  `config.oneDrive.redirectUri` — not a dynamic port. Default matches the registered URI, so no
-  config edit is required.
-- That URI is a **"Web" platform** registration → confidential → a secret-less token exchange
-  fails with `AADSTS7000218`. So `config.oneDrive.clientSecret` (new, optional) is sent with the
-  code exchange + refresh when set. The user must put the Pensieve app's client secret there.
-  (If they instead register the URI under "Mobile and desktop applications", leave it empty.)
+## Azure / config (settled 2026-10-09 after inspecting Pensieve's live config)
+The app is a **public client** — no secret needed. Confirmed from Pensieve's secret store
+(`~/Library/Application Support/xyz.erdman.pensieve/secrets.json`, same clientId `51c918…`):
+`azure-config` has no `clientSecret` and there's a live `refresh-token`, so Pensieve completed
+OAuth with PKCE and no secret. Therefore:
+- Microsoft matches `redirect_uri` by exact string → the loopback server binds the exact port +
+  path from `config.oneDrive.redirectUri`. Default `http://localhost:3000/api/auth/callback`
+  (the URI the user confirmed is registered). **No config edit required.**
+- `config.oneDrive.clientSecret` (new, optional) stays **empty** — only a safety net, sent only
+  if non-empty, for the (not-our-case) scenario where a redirect is registered under "Web".
+- Proven fallback: Pensieve's actual redirect `http://localhost:8711/callback` is secret-free
+  and definitely registered (it has a refresh token). If `:3000` ever errors `AADSTS7000218`,
+  switch `redirectUri` to `:8711/callback`.
 
 ## Roadmap / status
 - [x] Loopback server
 - [x] PKCE + auth-code exchange in `OneDriveAuth`
 - [x] VM + View rewired, build green (`./build.sh`)
 - [x] Fixed-port binding + path match to the registered `:3000/api/auth/callback` URI
-- [x] Optional `clientSecret` (for the Web-platform app) wired through exchange + refresh
-- [ ] User: set `oneDrive.clientSecret` in config.json to the Pensieve app's secret
+- [x] Optional `clientSecret` safety net wired through exchange + refresh (stays empty)
+- [x] Confirmed public client (no secret) from Pensieve's live config — no config edit needed
 - [ ] **End-to-end walkthrough with the user** — click Sign In, browser opens, approve, sheet
       closes on its own, quota/account populate; then an actual upload still works. No GUI
       automation here, so this must be confirmed live.

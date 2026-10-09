@@ -15,14 +15,15 @@ audio hardware must be confirmed with the user (see CLAUDE.md "Testing notes").
       exchanged for tokens. New sheet is informational + Cancel only; refresh-token/Keychain
       logic unchanged. Uses the EXACT redirect URI already registered on the user's Azure app
       (http://localhost:3000/api/auth/callback, the Pensieve project's Web-platform URI) — the
-      loopback server binds that exact port 3000 + path. Because that's a "Web" platform
-      (confidential) registration, Microsoft rejects a secret-less exchange (AADSTS7000218), so
-      a new optional config field oneDrive.clientSecret is sent with the code exchange + refresh
-      when set. USER ACTION: put the Pensieve app's client secret in config.json
-      oneDrive.clientSecret (gitignored). Build green; NOT walked live — confirm: Sign In opens
-      the browser, approving closes the sheet on its own, account/quota populate, and a real
-      upload still works. Also confirm Cancel closes the sheet with no stuck listener, and that
-      port 3000 being free is required (error is clear if something else holds it).
+      loopback server binds that exact port 3000 + path. App is a PUBLIC client (no secret) —
+      confirmed from Pensieve's live secret store (same clientId, no clientSecret, has a working
+      refresh token). So NO config edit is needed: redirectUri defaults to :3000/api/auth/callback
+      and clientSecret stays empty (optional safety-net field only, sent only if non-empty).
+      Build green; NOT walked live — confirm: Sign In opens the browser, approving closes the
+      sheet on its own, account/quota populate, and a real upload still works. Also confirm
+      Cancel closes the sheet with no stuck listener, and that port 3000 being free is required
+      (clear error if something else holds it). If :3000 errors AADSTS7000218, switch
+      oneDrive.redirectUri to http://localhost:8711/callback (Pensieve's proven secret-free one).
 - [ ] Menu-bar right-click menu (2026-09-26, IN PROGRESS — awaiting user confirmation):
       right-clicking the RecBar menu-bar icon should show Show (opens the Library
       window) + Quit (NSApp.terminate). Implemented additively via StatusItemRightClickMenu

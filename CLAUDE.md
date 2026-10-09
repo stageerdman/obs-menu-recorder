@@ -916,16 +916,22 @@ per-file OneDrive share link.
       needed). `LoopbackOAuthServer` 404s any other path and errors clearly if the port is in
       use. The port+path are config-driven so a future Azure change is a config edit, not a code
       change.
-    - **Optional `clientSecret`** (`config.oneDrive.clientSecret`, empty by default): that
-      Pensieve redirect URI is registered under Azure's **"Web" platform**, which Microsoft
-      treats as *confidential* and will reject a secret-less token exchange with `AADSTS7000218`.
-      So `OneDriveAuth` sends a `client_secret` with the code exchange **and** the refresh grant
-      whenever one is configured (mirroring Pensieve, which sends the secret alongside PKCE for
-      the same Web app), and omits it when empty (a true public client under "Mobile and desktop
-      applications"). This makes RecBar work with the user's existing Web-platform app *or* a
-      future no-secret public registration without a code change. Everything else downstream
-      (`validAccessToken`'s transient-vs-definitive handling, Keychain storage) is unchanged from
-      the device-code design.
+    - **No client secret needed — it's a public client.** Confirmed 2026-10-09 from Pensieve's
+      own working secret store (`~/Library/Application Support/xyz.erdman.pensieve/secrets.json`,
+      same `clientId` as RecBar, `51c918…`): its `azure-config` has **no** `clientSecret` and it
+      holds a valid `refresh-token`, i.e. it completed OAuth as a public client with PKCE and no
+      secret. So RecBar needs no secret and no config edits — `config.oneDrive.redirectUri`
+      defaults to the `:3000/api/auth/callback` the user confirmed is registered, and
+      `clientSecret` stays empty. A `config.oneDrive.clientSecret` field exists as a harmless
+      safety net (sent with the code exchange + refresh only when non-empty) in case a
+      redirect URI ever turns out to be registered under Azure's confidential "Web" platform,
+      which rejects a secret-less exchange with `AADSTS7000218` — but that's not the case here.
+    - **Proven-working fallback redirect**: Pensieve's actually-configured redirect is
+      `http://localhost:8711/callback` (secret-free, has a live refresh token → definitely
+      registered and public-type). If `:3000/api/auth/callback` ever errors with `AADSTS7000218`
+      (i.e. it was registered as "Web"), switch `config.oneDrive.redirectUri` to
+      `http://localhost:8711/callback` — one config line, no secret. Everything else downstream
+      (`validAccessToken`'s transient-vs-definitive handling, Keychain storage) is unchanged.
     - **Refresh token must only be discarded on a *definitive* revoke, not any refresh
       failure (2026-09-27, user report: "constantly wants me to sign up to onedrive… why
       doesn't it just save it like before").** `validAccessToken()` originally called
