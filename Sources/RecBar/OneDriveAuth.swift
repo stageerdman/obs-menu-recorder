@@ -42,6 +42,15 @@ final class OneDriveAuth {
     /// than threaded through every method call, since there's only ever one configured account.
     var clientId: String = ""
 
+    /// The loopback OAuth redirect URI, from `RecBarConfig.oneDrive.redirectUri`. Must exactly
+    /// match one registered on the Azure app; its port + path are what the loopback server binds.
+    var redirectUri: String = "http://localhost:3000/api/auth/callback"
+
+    /// Optional client secret (empty = public client). Sent with the code exchange and refresh
+    /// only when non-empty — required when the redirect URI is registered under Azure's "Web"
+    /// platform. See `OneDriveConfig.clientSecret`.
+    var clientSecret: String = ""
+
     private static let tenant = "consumers"
     private static let scope = "Files.ReadWrite offline_access"
     private static let refreshTokenAccount = "refreshToken"
@@ -70,6 +79,12 @@ final class OneDriveAuth {
     func signInInteractive(timeout: TimeInterval = 300) async throws {
         guard !clientId.isEmpty else { throw AuthError.missingClientId }
 
+        guard let redirectURL = URL(string: redirectUri),
+              let port = redirectURL.port, let portValue = UInt16(exactly: port) else {
+            throw AuthError.signInFailed("invalid redirect URI in config: \(redirectUri)")
+        }
+        let path = redirectURL.path.isEmpty ? "/" : redirectURL.path
+
         let (verifier, challenge) = Self.makePKCE()
         let state = Self.randomURLSafe(32)
 
@@ -77,15 +92,13 @@ final class OneDriveAuth {
         let server = LoopbackOAuthServer()
         activeServer = server
         defer { activeServer = nil }
-        let port: UInt16
         do {
-            port = try await server.start()
+            try await server.start(port: portValue, path: path)
         } catch {
             throw AuthError.signInFailed(error.localizedDescription)
         }
-        let redirectURI = "http://localhost:\(port)/callback"
 
-        openConsentPage(redirectURI: redirectURI, state: state, challenge: challenge)
+        openConsentPage(redirectURI: redirectUri, state: state, challenge: challenge)
 
         let redirect: LoopbackOAuthServer.Redirect
         do {
@@ -102,7 +115,7 @@ final class OneDriveAuth {
         guard redirect.state == state else { throw AuthError.stateMismatch }
         guard let code = redirect.code else { throw AuthError.signInFailed("no authorization code returned") }
 
-        try await exchangeCode(code, verifier: verifier, redirectURI: redirectURI)
+        try await exchangeCode(code, verifier: verifier, redirectURI: redirectUri)
     }
 
     /// Tears down an in-flight interactive sign-in (from a UI "Cancel"), causing
@@ -134,14 +147,16 @@ final class OneDriveAuth {
         var request = URLRequest(url: URL(string: "https://login.microsoftonline.com/\(Self.tenant)/oauth2/v2.0/token")!)
         request.httpMethod = "POST"
         request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
-        request.httpBody = formBody([
+        var params = [
             "client_id": clientId,
             "grant_type": "authorization_code",
             "code": code,
             "redirect_uri": redirectURI,
             "code_verifier": verifier,
             "scope": Self.scope,
-        ])
+        ]
+        if !clientSecret.isEmpty { params["client_secret"] = clientSecret }
+        request.httpBody = formBody(params)
 
         let (data, response) = try await URLSession.shared.data(for: request)
         let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
@@ -195,12 +210,14 @@ final class OneDriveAuth {
         var request = URLRequest(url: URL(string: "https://login.microsoftonline.com/\(Self.tenant)/oauth2/v2.0/token")!)
         request.httpMethod = "POST"
         request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
-        request.httpBody = formBody([
+        var params = [
             "client_id": clientId,
             "grant_type": "refresh_token",
             "refresh_token": refreshToken,
             "scope": Self.scope
-        ])
+        ]
+        if !clientSecret.isEmpty { params["client_secret"] = clientSecret }
+        request.httpBody = formBody(params)
 
         let (data, response) = try await URLSession.shared.data(for: request)
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0

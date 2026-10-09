@@ -141,23 +141,41 @@ struct ModeConfig: Codable {
 struct OneDriveConfig: Codable {
     var clientId: String
     var rootFolderName: String
+    /// The loopback OAuth redirect URI — must EXACTLY match one registered on the Azure app
+    /// (Microsoft matches `redirect_uri` by exact string, including the port and path, for a
+    /// specifically-registered loopback URI). The loopback sign-in server binds the port and
+    /// path parsed out of this. Defaults to the URI already registered on the user's existing
+    /// app registration (`:3000/api/auth/callback`, originally added for the Pensieve project).
+    var redirectUri: String
+    /// Optional OAuth client secret. Left empty for a *public* client (the no-secret +
+    /// PKCE design). Set it only if the Azure app's redirect URI is registered under the
+    /// **"Web"** platform, which Microsoft treats as confidential and will otherwise reject the
+    /// token exchange with `AADSTS7000218`. When non-empty it's sent with the code exchange and
+    /// token refresh (mirroring the Pensieve project, which reuses the same Web-platform app).
+    var clientSecret: String
 
     enum CodingKeys: String, CodingKey {
-        case clientId, rootFolderName
+        case clientId, rootFolderName, redirectUri, clientSecret
     }
 
-    init(clientId: String, rootFolderName: String) {
+    init(clientId: String, rootFolderName: String,
+         redirectUri: String = "http://localhost:3000/api/auth/callback",
+         clientSecret: String = "") {
         self.clientId = clientId
         self.rootFolderName = rootFolderName
+        self.redirectUri = redirectUri
+        self.clientSecret = clientSecret
     }
 
     /// Migration-safe: an older config.json with no oneDrive block at all is handled by
     /// RecBarConfig's own decodeIfPresent fallback to `.default` below — this decoder only
-    /// needs to cover a oneDrive block that predates `rootFolderName` specifically.
+    /// needs to cover a oneDrive block that predates `rootFolderName`/`redirectUri`/`clientSecret`.
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         clientId = try c.decodeIfPresent(String.self, forKey: .clientId) ?? ""
         rootFolderName = try c.decodeIfPresent(String.self, forKey: .rootFolderName) ?? "RecBar Recordings"
+        redirectUri = try c.decodeIfPresent(String.self, forKey: .redirectUri) ?? "http://localhost:3000/api/auth/callback"
+        clientSecret = try c.decodeIfPresent(String.self, forKey: .clientSecret) ?? ""
     }
 
     static let `default` = OneDriveConfig(clientId: "", rootFolderName: "RecBar Recordings")

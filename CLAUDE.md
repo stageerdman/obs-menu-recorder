@@ -907,13 +907,25 @@ per-file OneDrive share link.
     your browser") plus a Cancel that tears down the loopback listener
     (`cancelInteractiveSignIn` → the awaited redirect resolves with `AuthError.cancelled`,
     swallowed by the VM rather than surfaced).
-    - **One-time Azure change this needs**: the app registration (still a public client,
-      "Allow public client flows" on) must have a redirect URI registered under
-      **Authentication → Add a platform → "Mobile and desktop applications" → `http://localhost`**.
-      Microsoft matches loopback redirects *ignoring the port* (RFC 8252), so the dynamic
-      ephemeral port needs nothing more than that single `http://localhost` entry. No client
-      secret. Everything downstream (`validAccessToken`, the refresh-token grant, Keychain
-      storage) is unchanged from the device-code design.
+    - **Redirect URI + fixed port**: Microsoft matches `redirect_uri` by **exact string**
+      (port and path included) when a specific loopback URI is registered — so the loopback
+      server binds the *exact* port and path from `config.oneDrive.redirectUri` rather than a
+      dynamic ephemeral port. The default is `http://localhost:3000/api/auth/callback`, which is
+      already registered on the user's existing Azure app (originally added for the **Pensieve**
+      project — the user confirmed 2026-10-09 it's there, so no new Azure redirect-URI step was
+      needed). `LoopbackOAuthServer` 404s any other path and errors clearly if the port is in
+      use. The port+path are config-driven so a future Azure change is a config edit, not a code
+      change.
+    - **Optional `clientSecret`** (`config.oneDrive.clientSecret`, empty by default): that
+      Pensieve redirect URI is registered under Azure's **"Web" platform**, which Microsoft
+      treats as *confidential* and will reject a secret-less token exchange with `AADSTS7000218`.
+      So `OneDriveAuth` sends a `client_secret` with the code exchange **and** the refresh grant
+      whenever one is configured (mirroring Pensieve, which sends the secret alongside PKCE for
+      the same Web app), and omits it when empty (a true public client under "Mobile and desktop
+      applications"). This makes RecBar work with the user's existing Web-platform app *or* a
+      future no-secret public registration without a code change. Everything else downstream
+      (`validAccessToken`'s transient-vs-definitive handling, Keychain storage) is unchanged from
+      the device-code design.
     - **Refresh token must only be discarded on a *definitive* revoke, not any refresh
       failure (2026-09-27, user report: "constantly wants me to sign up to onedrive… why
       doesn't it just save it like before").** `validAccessToken()` originally called

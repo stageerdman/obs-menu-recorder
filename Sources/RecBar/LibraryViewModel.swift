@@ -35,6 +35,8 @@ final class LibraryViewModel: ObservableObject {
     init(config: RecBarConfig) {
         self.config = config
         auth.clientId = config.oneDrive.clientId
+        auth.redirectUri = config.oneDrive.redirectUri
+        auth.clientSecret = config.oneDrive.clientSecret
     }
 
     func start() {

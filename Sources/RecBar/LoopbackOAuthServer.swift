@@ -38,7 +38,11 @@ final class LoopbackOAuthServer {
     private var listener: NWListener?
     private var connection: NWConnection?
     private var redirectContinuation: CheckedContinuation<Redirect, Error>?
+    private var startContinuation: CheckedContinuation<Void, Error>?
     private var timeoutTask: Task<Void, Never>?
+    /// The path the OAuth redirect will hit (e.g. `/api/auth/callback`). Requests to any other
+    /// path (favicon, etc.) get a 404 and the server keeps waiting for the real redirect.
+    private var expectedPath = "/callback"
 
     private static let closePage = """
     <!doctype html><html><head><meta charset="utf-8"><title>RecBar</title>
@@ -49,11 +53,18 @@ final class LoopbackOAuthServer {
     <p>You can close this tab and return to RecBar.</p></div></body></html>
     """
 
-    /// Binds an ephemeral loopback port and returns it. Must be called (and must succeed)
-    /// before the browser is opened, so the redirect is never missed.
-    func start() async throws -> UInt16 {
+    /// Binds the given loopback `port` and listens for the OAuth redirect on `path`. Must be
+    /// called (and must succeed) before the browser is opened, so the redirect is never missed.
+    /// Throws `.bindFailed` if the port is already in use — the redirect would otherwise land on
+    /// whatever else holds the port and the sign-in could never complete.
+    func start(port: UInt16, path: String) async throws {
+        expectedPath = path.isEmpty ? "/" : path
+
+        guard let nwPort = NWEndpoint.Port(rawValue: port) else {
+            throw ServerError.bindFailed("invalid port \(port)")
+        }
         let params = NWParameters.tcp
-        params.requiredLocalEndpoint = .hostPort(host: "127.0.0.1", port: .any)
+        params.requiredLocalEndpoint = .hostPort(host: "127.0.0.1", port: nwPort)
         // Allow a quick rebind if a previous attempt left the port in TIME_WAIT.
         if let tcp = params.defaultProtocolStack.internetProtocol as? NWProtocolTCP.Options {
             tcp.enableKeepalive = false
@@ -67,18 +78,18 @@ final class LoopbackOAuthServer {
         }
         self.listener = listener
 
-        return try await withCheckedThrowingContinuation { cont in
+        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+            self.startContinuation = cont
             listener.stateUpdateHandler = { [weak self] state in
                 switch state {
                 case .ready:
-                    guard let port = listener.port?.rawValue else {
-                        cont.resume(throwing: ServerError.bindFailed("no port assigned"))
-                        return
-                    }
-                    cont.resume(returning: port)
+                    Task { @MainActor in self?.resumeStart(.success(())) }
                 case .failed(let error):
-                    cont.resume(throwing: ServerError.bindFailed(error.localizedDescription))
-                    Task { @MainActor in self?.cleanup() }
+                    Task { @MainActor in
+                        self?.resumeStart(.failure(ServerError.bindFailed(
+                            "port \(port) may be in use (\(error.localizedDescription))")))
+                        self?.cleanup()
+                    }
                 default:
                     break
                 }
@@ -88,6 +99,12 @@ final class LoopbackOAuthServer {
             }
             listener.start(queue: .main)
         }
+    }
+
+    private func resumeStart(_ result: Result<Void, Error>) {
+        guard let cont = startContinuation else { return }
+        startContinuation = nil
+        cont.resume(with: result)
     }
 
     /// Awaits the browser redirect to the loopback port, or throws on timeout.
@@ -122,9 +139,21 @@ final class LoopbackOAuthServer {
     }
 
     private func respond(to conn: NWConnection, request: String) {
-        // First line: "GET /callback?code=…&state=… HTTP/1.1"
+        // First line: "GET /api/auth/callback?code=…&state=… HTTP/1.1"
         let firstLine = request.split(separator: "\r\n", maxSplits: 1).first.map(String.init) ?? ""
         let target = firstLine.split(separator: " ").dropFirst().first.map(String.init) ?? ""
+        let reqPath = target.split(separator: "?", maxSplits: 1).first.map(String.init) ?? ""
+
+        // Ignore anything that isn't the OAuth redirect path (favicon, etc.) and keep waiting.
+        guard reqPath == expectedPath else {
+            let notFound = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            conn.send(content: notFound.data(using: .utf8)!, completion: .contentProcessed { _ in
+                conn.cancel()
+            })
+            // Listener stays up — the real redirect arrives as a fresh connection.
+            return
+        }
+
         let query = target.split(separator: "?", maxSplits: 1).dropFirst().first.map(String.init) ?? ""
 
         var code: String?, state: String?, errorParam: String?
