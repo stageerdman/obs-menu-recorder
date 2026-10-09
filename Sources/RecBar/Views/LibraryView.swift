@@ -46,8 +46,8 @@ struct LibraryView: View {
         // window as an AppKit NSWindow — see that file. Here we only manage the view model.
         .onAppear { viewModel.start() }
         .onDisappear { viewModel.stop() }
-        .sheet(item: $viewModel.signInPrompt) { device in
-            OneDriveSignInView(device: device)
+        .sheet(isPresented: $viewModel.isSigningIn) {
+            OneDriveSignInView(viewModel: viewModel)
         }
         .alert("OneDrive", isPresented: Binding(
             get: { viewModel.signInError != nil },
@@ -382,27 +382,28 @@ private struct OneDriveQuotaView: View {
     }
 }
 
+/// Shown while an interactive sign-in is in flight. The browser has already been opened to the
+/// Microsoft consent screen (the loopback listener catches the redirect automatically), so this
+/// is purely informational — no code to copy — plus a Cancel for when the user backs out.
 private struct OneDriveSignInView: View {
-    let device: DeviceCodeResponse
+    @ObservedObject var viewModel: LibraryViewModel
 
     var body: some View {
         VStack(spacing: 16) {
-            Text("Sign in to OneDrive")
+            Image(systemName: "cloud")
+                .font(.system(size: 34, weight: .light))
+                .foregroundStyle(.secondary)
+            Text("Finishing sign-in in your browser")
                 .font(.headline)
-            Text("Enter this code at the link below:")
+            Text("A Microsoft sign-in page just opened in your browser. Sign in there and this "
+                 + "will complete on its own — you can then close that tab.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
-            Text(device.userCode)
-                .font(.system(.title, design: .monospaced))
-                .textSelection(.enabled)
-            Button("Open Microsoft Sign-In…") {
-                if let url = URL(string: device.verificationUri) {
-                    NSWorkspace.shared.open(url)
-                }
-            }
-            .buttonStyle(.borderedProminent)
-            ProgressView("Waiting for confirmation…")
+                .multilineTextAlignment(.center)
+            ProgressView()
                 .controlSize(.small)
+            Button("Cancel") { viewModel.cancelSignIn() }
+                .keyboardShortcut(.cancelAction)
         }
         .padding(24)
         .frame(width: 320)

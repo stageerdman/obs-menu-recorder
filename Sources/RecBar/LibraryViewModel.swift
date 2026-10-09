@@ -15,7 +15,10 @@ final class LibraryViewModel: ObservableObject {
     @Published private(set) var quota: OneDriveClient.DriveQuota?
     @Published private(set) var account: OneDriveClient.DriveAccount?
     @Published private(set) var isSignedIn = false
-    @Published var signInPrompt: DeviceCodeResponse?
+    /// True while an interactive browser sign-in is in flight (loopback listener bound, waiting
+    /// for the user to finish in their browser). Drives the lightweight "finish in your browser"
+    /// sheet, which now just informs + offers Cancel rather than showing a code to copy.
+    @Published var isSigningIn = false
     @Published var signInError: String?
 
     /// Whether OneDrive is usable at all — an empty `clientId` means there's no app registration
@@ -27,6 +30,7 @@ final class LibraryViewModel: ObservableObject {
     private let client = OneDriveClient()
     private var timer: Timer?
     private var uploadTasks: [UUID: Task<Void, Never>] = [:]
+    private var signInTask: Task<Void, Never>?
 
     init(config: RecBarConfig) {
         self.config = config
@@ -324,16 +328,29 @@ final class LibraryViewModel: ObservableObject {
             signInError = "Set oneDrive.clientId in config.json first — see README for setup steps."
             return
         }
-        Task { [weak self] in
+        signInTask?.cancel()
+        signInTask = Task { [weak self] in
             guard let self else { return }
             do {
                 try await self.signIn()
                 self.refreshQuota()
+            } catch is CancellationError {
+                return
+            } catch OneDriveAuth.AuthError.cancelled {
+                return
             } catch {
                 if Task.isCancelled { return }
                 self.signInError = "OneDrive sign-in failed: \(error.localizedDescription)"
             }
         }
+    }
+
+    /// Backs out of an in-flight interactive sign-in: tears down the loopback listener (which
+    /// unblocks the awaited redirect with `AuthError.cancelled`) and dismisses the sheet.
+    func cancelSignIn() {
+        auth.cancelInteractiveSignIn()
+        signInTask?.cancel()
+        isSigningIn = false
     }
 
     /// Switches which OneDrive account recordings upload into: forgets the current credential,
@@ -451,10 +468,9 @@ final class LibraryViewModel: ObservableObject {
     }
 
     private func signIn() async throws {
-        let device = try await auth.requestDeviceCode()
-        signInPrompt = device
-        defer { signInPrompt = nil }
-        try await auth.pollForToken(device)
+        isSigningIn = true
+        defer { isSigningIn = false }
+        try await auth.signInInteractive()
     }
 
     private func setState(_ id: UUID, _ state: CloudUploadState, error: String? = nil) {

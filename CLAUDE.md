@@ -138,7 +138,8 @@ elapsed time + an expandable live-audio-level debug drawer while recording.
   its own code.
 - `Sources/RecBar/LibraryStore.swift`, `LibraryViewModel.swift`, `Views/LibraryView.swift`,
   `FilePromiseDragHandle.swift`, `KeychainHelper.swift`, `OneDriveAuth.swift`,
-  `OneDriveClient.swift` — the Library window (see "Library window & OneDrive sharing" below),
+  `LoopbackOAuthServer.swift`, `OneDriveClient.swift` — the Library window (see "Library window
+  & OneDrive sharing" below),
   opened via a small button added to `PopoverContent`'s header calling
   `openWindow(id: "library")`, which resolves to a new single-instance `Window("Library", id:
   "library")` scene in `RecBarApp.swift`. `Window` (as opposed to `WindowGroup`, which spawns a
@@ -885,15 +886,34 @@ per-file OneDrive share link.
   zero-dependency ethos as `OBSClient`'s own hand-rolled obs-websocket protocol; **not yet
   verified end-to-end** — needs a real Azure app registration + populated `config.json`
   `oneDrive.clientId`, which hadn't happened as of this writing):
-  - `OneDriveAuth` — OAuth2 **device code flow** against the `consumers` tenant (personal
-    Microsoft accounts, per explicit user choice over work/school), scopes `Files.ReadWrite
-    offline_access`. Chosen over an embedded-webview/redirect auth-code flow because this is a
-    menu-bar app with no webview and no registered custom URL scheme. Only the refresh token
-    is persisted (`KeychainHelper`, plain `Security` framework calls — no entitlements needed,
-    RecBar isn't sandboxed); the access token lives in memory only, re-minted on demand.
-    Requires the Azure app registration to have **"Allow public client flows" enabled**, or
-    device code flow fails outright (`AADSTS7000218`) since there's deliberately no client
-    secret in this design (a public client's device-code/refresh tokens don't need one).
+  - `OneDriveAuth` — OAuth2 **authorization-code flow with PKCE** against the `consumers`
+    tenant (personal Microsoft accounts, per explicit user choice over work/school), scopes
+    `Files.ReadWrite offline_access`. **Changed from device-code flow 2026-10-09** (branch
+    `resumable-onedrive-uploads`, awaiting live confirmation — see the
+    `updates/2026-10-09 OneDrive Loopback Sign-In - OPEN/` folder), modelled on the Pensieve
+    project's loopback approach: the old device-code flow made the user copy a code into a
+    separate page AND popped a modal sheet that blocked the rest of RecBar's UI until it
+    resolved (the user got stuck mid-sign-in, unable to use transport controls). The new flow
+    is one click → the real system browser opens to the Microsoft consent screen
+    (`NSWorkspace.shared.open`) → a **one-shot loopback HTTP server** (`LoopbackOAuthServer`,
+    `Network.framework` `NWListener` bound loopback-only to an OS-assigned ephemeral port) catches
+    the `?code=…&state=…` redirect automatically and serves a "close this tab" page → the code +
+    PKCE `code_verifier` are POSTed to the token endpoint for the refresh/access tokens. PKCE
+    (S256, via `CryptoKit` + `SecRandomCopyBytes`) is what lets this stay a *public* client with
+    **no client secret** (same stance as before). Still only the refresh token is persisted
+    (`KeychainHelper`, plain `Security` framework calls — no entitlements needed, RecBar isn't
+    sandboxed); the access token lives in memory only, re-minted on demand. The interactive
+    sign-in sheet (`OneDriveSignInView`) is now non-blocking — purely informational ("finish in
+    your browser") plus a Cancel that tears down the loopback listener
+    (`cancelInteractiveSignIn` → the awaited redirect resolves with `AuthError.cancelled`,
+    swallowed by the VM rather than surfaced).
+    - **One-time Azure change this needs**: the app registration (still a public client,
+      "Allow public client flows" on) must have a redirect URI registered under
+      **Authentication → Add a platform → "Mobile and desktop applications" → `http://localhost`**.
+      Microsoft matches loopback redirects *ignoring the port* (RFC 8252), so the dynamic
+      ephemeral port needs nothing more than that single `http://localhost` entry. No client
+      secret. Everything downstream (`validAccessToken`, the refresh-token grant, Keychain
+      storage) is unchanged from the device-code design.
     - **Refresh token must only be discarded on a *definitive* revoke, not any refresh
       failure (2026-09-27, user report: "constantly wants me to sign up to onedrive… why
       doesn't it just save it like before").** `validAccessToken()` originally called

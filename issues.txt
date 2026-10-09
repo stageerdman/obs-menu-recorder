@@ -6,6 +6,18 @@ environment, so anything needing a real click, a real OBS instance, or real
 audio hardware must be confirmed with the user (see CLAUDE.md "Testing notes").
 
 ## Needs end-to-end verification with the user
+- [ ] OneDrive sign-in rewritten: device-code → loopback auth-code + PKCE (2026-10-09,
+      branch resumable-onedrive-uploads, awaiting user confirmation). Replaces the
+      copy-a-code flow and its blocking modal sheet (which trapped the user mid-sign-in)
+      with Pensieve's approach: click Sign In → real browser opens to the Microsoft consent
+      screen → a one-shot loopback HTTP server (LoopbackOAuthServer, NWListener on an
+      ephemeral 127.0.0.1 port) catches the redirect automatically → code+PKCE-verifier
+      exchanged for tokens. New sheet is informational + Cancel only; refresh-token/Keychain
+      logic unchanged. REQUIRES a one-time Azure change: app registration → Authentication →
+      Add a platform → "Mobile and desktop applications" → redirect URI http://localhost
+      (port is ignored for loopback). Same clientId. Build green; NOT walked live — confirm:
+      Sign In opens the browser, approving closes the sheet on its own, account/quota populate,
+      and a real upload still works. Also confirm Cancel closes the sheet with no stuck listener.
 - [ ] Menu-bar right-click menu (2026-09-26, IN PROGRESS — awaiting user confirmation):
       right-clicking the RecBar menu-bar icon should show Show (opens the Library
       window) + Quit (NSApp.terminate). Implemented additively via StatusItemRightClickMenu
