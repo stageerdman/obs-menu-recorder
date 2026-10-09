@@ -15,15 +15,16 @@ audio hardware must be confirmed with the user (see CLAUDE.md "Testing notes").
       exchanged for tokens. New sheet is informational + Cancel only; refresh-token/Keychain
       logic unchanged. Uses the EXACT redirect URI already registered on the user's Azure app
       (http://localhost:3000/api/auth/callback, the Pensieve project's Web-platform URI) — the
-      loopback server binds that exact port 3000 + path. App is a PUBLIC client (no secret) —
-      confirmed from Pensieve's live secret store (same clientId, no clientSecret, has a working
-      refresh token). So NO config edit is needed: redirectUri defaults to :3000/api/auth/callback
-      and clientSecret stays empty (optional safety-net field only, sent only if non-empty).
-      Build green; NOT walked live — confirm: Sign In opens the browser, approving closes the
-      sheet on its own, account/quota populate, and a real upload still works. Also confirm
-      Cancel closes the sheet with no stuck listener, and that port 3000 being free is required
-      (clear error if something else holds it). If :3000 errors AADSTS7000218, switch
-      oneDrive.redirectUri to http://localhost:8711/callback (Pensieve's proven secret-free one).
+      loopback server binds the exact port + path from oneDrive.redirectUri. RecBar's app
+      (clientId bae96960-…, DIFFERENT from Pensieve's 51c918-…) is a PUBLIC client (worked with
+      device-code + no secret), so clientSecret stays empty (optional safety-net field, sent
+      only if non-empty). Redirect URI must be one registered on bae96960: user confirmed
+      :3000/api/auth/callback is there, then asked to switch to :8711/callback (set 2026-10-09).
+      CAVEAT: 8711 only works if it's ALSO registered on bae96960 — else AADSTS50011 (redirect
+      mismatch); fall back to :3000. Build green; NOT walked live — confirm: Sign In opens the
+      browser, approving closes the sheet on its own, account/quota populate, and a real upload
+      still works. Also confirm Cancel closes the sheet with no stuck listener, and that the
+      bound port being free is required (clear error if something else holds it).
 - [ ] Menu-bar right-click menu (2026-09-26, IN PROGRESS — awaiting user confirmation):
       right-clicking the RecBar menu-bar icon should show Show (opens the Library
       window) + Quit (NSApp.terminate). Implemented additively via StatusItemRightClickMenu

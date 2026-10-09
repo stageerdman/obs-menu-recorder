@@ -35,19 +35,18 @@ Authorization-code flow with **PKCE**, **public client** (no client secret — s
 - `Sources/RecBar/Views/LibraryView.swift` — the code sheet → a lightweight "finishing in your
   browser" sheet with a Cancel button.
 
-## Azure / config (settled 2026-10-09 after inspecting Pensieve's live config)
-The app is a **public client** — no secret needed. Confirmed from Pensieve's secret store
-(`~/Library/Application Support/xyz.erdman.pensieve/secrets.json`, same clientId `51c918…`):
-`azure-config` has no `clientSecret` and there's a live `refresh-token`, so Pensieve completed
-OAuth with PKCE and no secret. Therefore:
+## Azure / config (settled 2026-10-09)
+**RecBar and Pensieve are different Azure apps** (initial "same clientId" claim was a misread):
+RecBar = `bae96960-…`, Pensieve = `51c918c5-…`. A redirect URI must be registered on RecBar's
+app (`bae96960`). RecBar's app is a **public client** — it worked with device-code (public
+flow) + no secret, so PKCE-no-secret is fine. Therefore:
 - Microsoft matches `redirect_uri` by exact string → the loopback server binds the exact port +
-  path from `config.oneDrive.redirectUri`. Default `http://localhost:3000/api/auth/callback`
-  (the URI the user confirmed is registered). **No config edit required.**
-- `config.oneDrive.clientSecret` (new, optional) stays **empty** — only a safety net, sent only
-  if non-empty, for the (not-our-case) scenario where a redirect is registered under "Web".
-- Proven fallback: Pensieve's actual redirect `http://localhost:8711/callback` is secret-free
-  and definitely registered (it has a refresh token). If `:3000` ever errors `AADSTS7000218`,
-  switch `redirectUri` to `:8711/callback`.
+  path from `config.oneDrive.redirectUri`.
+- User confirmed `http://localhost:3000/api/auth/callback` is registered on RecBar's app, then
+  asked to switch to `http://localhost:8711/callback` → done. **Caveat**: 8711 only works if it
+  too is registered on `bae96960`, else `AADSTS50011` (redirect mismatch) — fall back to 3000.
+- `config.oneDrive.clientSecret` (new, optional) stays **empty** — safety net only, sent if
+  non-empty, for a "Web"-platform registration (not our case; would otherwise be `AADSTS7000218`).
 
 ## Roadmap / status
 - [x] Loopback server
