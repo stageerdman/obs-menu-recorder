@@ -1,5 +1,6 @@
 import Foundation
 import Combine
+import CoreAudio
 
 enum RecordingMode: String, CaseIterable, Identifiable, Codable {
     case sales
@@ -99,6 +100,23 @@ final class AppState: ObservableObject {
     /// recording, which would mask real silence on the channels that matter. Set in
     /// `beginRecording`, cleared in `resetToIdle`.
     private(set) var watchdogChannelNames: Set<String> = []
+    /// Which physical mic is actually routed live right now — set alongside
+    /// `resolvedMicSourceName` at recording start and on every live failover switch (see
+    /// `tickMicFailover`), cleared in `resetToIdle`. Tracked separately from
+    /// `resolvedMicSourceName` (an OBS input *name*) because the failover tick needs to compare
+    /// against `MicrophonePriority`'s role, not a source name.
+    private var currentMicRole: MicSourceRole?
+    /// Debounces `tickMicFailover`: the role detected as newly-desired, and when it was first
+    /// seen differing from `currentMicRole`. A switch only actually happens once the same
+    /// desired role has held for `micFailoverStabilitySeconds` straight ticks, so a single
+    /// transient CoreAudio enumeration blip (as opposed to a real, sustained disconnect) doesn't
+    /// cause a spurious mid-recording switch.
+    private var pendingMicRoleChange: (role: MicSourceRole, since: Date)?
+    /// How long the desired role must hold before `tickMicFailover` actually switches.
+    private let micFailoverStabilitySeconds: TimeInterval = 2
+    /// Guards against overlapping live-switch attempts — the OBS round trips involved (plus
+    /// `applyMicrophonePriority`'s own 300ms USB settle delay) can outlast one 1s tick.
+    private var micFailoverInFlight = false
     /// Last time any channel in `watchdogChannelNames` was at/above the watchdog threshold.
     /// Reset on recording start, on resume from pause, and on any presence confirmation.
     private var micLastAboveThresholdDate: Date?
@@ -287,12 +305,7 @@ final class AppState: ObservableObject {
         }
 
         currentMode = mode
-        resolvedMicDescription = "\(resolved.deviceName) (\(resolved.role == .usb ? "USB" : "built-in"))"
-        resolvedMicSourceName = resolved.role == .usb ? config.sources.micUSBSourceName : config.sources.micBuiltInSourceName
-        watchdogChannelNames = Set([resolvedMicSourceName].compactMap { $0 })
-        if mode != .guide && mode != .captainLog {
-            watchdogChannelNames.insert(config.sources.desktopAudioSourceName)
-        }
+        applyResolvedMicState(resolved, mode: mode)
         watchdogEnabled = modeConfig.watchdog.enabled
         recordStartDate = Date()
         pausedAccumulated = 0
@@ -331,6 +344,85 @@ final class AppState: ObservableObject {
         try await obs.setInputMute(inputName: sources.micWiredSourceName, muted: true)
         if includeDesktopAudio {
             try await obs.setInputMute(inputName: sources.desktopAudioSourceName, muted: false)
+        }
+    }
+
+    /// Updates every bit of published/tracked state that describes which mic is live, shared
+    /// between `beginRecording`'s initial resolution and `performLiveMicFailover`'s mid-
+    /// recording switches so both stay in sync about what the debug drawer and silence watchdog
+    /// should be reading.
+    private func applyResolvedMicState(_ resolved: ResolvedMic, mode: RecordingMode) {
+        currentMicRole = resolved.role
+        resolvedMicDescription = "\(resolved.deviceName) (\(resolved.role == .usb ? "USB" : "built-in"))"
+        resolvedMicSourceName = resolved.role == .usb ? config.sources.micUSBSourceName : config.sources.micBuiltInSourceName
+        var channelNames = Set([resolvedMicSourceName].compactMap { $0 })
+        if mode != .guide && mode != .captainLog {
+            channelNames.insert(config.sources.desktopAudioSourceName)
+        }
+        watchdogChannelNames = channelNames
+    }
+
+    /// Runs every second from `tickElapsed` while actively recording (never while paused, same
+    /// as the silence watchdog) — watches for the USB mic ("USB PnP") connecting or
+    /// disconnecting mid-recording and live-switches OBS's routing to match, with no stop/
+    /// restart of the recording. Explicit user request (2026-11-09): the physical USB
+    /// connection on this hardware is occasionally flaky and drops for a moment mid-recording,
+    /// silently leaving the recorded mic track blank until someone notices — this fails over to
+    /// the built-in Mac mic automatically, and back to USB the moment it reconnects. The
+    /// headphone/wired mic is still never auto-selected, matching `MicrophonePriority`'s
+    /// existing priority rule — the user confirmed USB-or-built-in is always available, so no
+    /// third fallback tier is needed here.
+    private func tickMicFailover() {
+        guard let currentMode, let currentMicRole, !micFailoverInFlight else { return }
+        let usbPresent = MicrophonePriority.inputDevices().contains { $0.transportType == kAudioDeviceTransportTypeUSB }
+        let desiredRole: MicSourceRole = usbPresent ? .usb : .builtIn
+        guard desiredRole != currentMicRole else {
+            pendingMicRoleChange = nil
+            return
+        }
+        let now = Date()
+        guard let pending = pendingMicRoleChange, pending.role == desiredRole else {
+            pendingMicRoleChange = (desiredRole, now)
+            return
+        }
+        guard now.timeIntervalSince(pending.since) >= micFailoverStabilitySeconds else { return }
+        pendingMicRoleChange = nil
+        performLiveMicFailover(to: desiredRole, mode: currentMode)
+    }
+
+    /// The actual mid-recording switch `tickMicFailover` decided on — re-runs the exact same
+    /// `applyMicrophonePriority`/`applyAudioTrackRouting` calls `beginRecording` makes at the
+    /// start of a recording, just against a freshly-resolved mic instead. Re-checks
+    /// `recordingState`/`currentMode` before and after the OBS round trips so a switch still in
+    /// flight can't race a manual Stop that lands in between.
+    private func performLiveMicFailover(to role: MicSourceRole, mode: RecordingMode) {
+        guard !micFailoverInFlight else { return }
+        micFailoverInFlight = true
+        Task {
+            defer { micFailoverInFlight = false }
+            guard recordingState == .recording, currentMode == mode else { return }
+            do {
+                let resolved: ResolvedMic
+                if role == .usb {
+                    // Re-resolve rather than trusting the presence check above alone — this
+                    // needs the live deviceUID/deviceName, and the device could in principle
+                    // have vanished again in the moment between detection and this Task running.
+                    resolved = try MicrophonePriority.resolve()
+                    guard resolved.role == .usb else { return }
+                } else if let builtIn = MicrophonePriority.inputDevices().first(where: { $0.uid == "BuiltInMicrophoneDevice" }) {
+                    resolved = ResolvedMic(role: .builtIn, deviceUID: builtIn.uid, deviceName: builtIn.name)
+                } else {
+                    return // built-in mic itself is gone — nothing sensible to switch to
+                }
+                let includeDesktopAudio = mode != .captainLog
+                try await applyMicrophonePriority(resolved, includeDesktopAudio: includeDesktopAudio)
+                try await applyAudioTrackRouting(resolved, includeDesktopAudio: includeDesktopAudio, includeScreen: mode != .captainLog)
+                guard recordingState == .recording, currentMode == mode else { return }
+                applyResolvedMicState(resolved, mode: mode)
+                NSLog("RecBar: live mic failover switched to \(resolved.deviceName) (\(role == .usb ? "USB" : "built-in"))")
+            } catch {
+                NSLog("RecBar: live mic failover to \(role) failed: \(error)")
+            }
         }
     }
 
@@ -854,6 +946,8 @@ final class AppState: ObservableObject {
         currentMode = nil
         resolvedMicDescription = nil
         resolvedMicSourceName = nil
+        currentMicRole = nil
+        pendingMicRoleChange = nil
         watchdogChannelNames = []
         watchdogEnabled = false
         recordStartDate = nil
@@ -896,6 +990,7 @@ final class AppState: ObservableObject {
             return // frozen while paused — the watchdog is suppressed along with it
         }
         elapsed = Date().timeIntervalSince(recordStartDate) - pausedAccumulated
+        tickMicFailover()
         tickWatchdog()
     }
 
