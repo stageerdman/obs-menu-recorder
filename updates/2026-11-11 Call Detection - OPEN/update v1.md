@@ -11,8 +11,8 @@ message) are explicitly acceptable; a missed call is not.
   (`kAudioHardwarePropertyProcessObjectList` → `kAudioProcessPropertyIsRunningInput` +
   `kAudioProcessPropertyBundleID`, macOS 14+) and reports the first allowlisted app capturing
   input. Allowlist, not "anything on the mic": the user also runs a dictation app, and OBS
-  itself holds the mic while recording. Debounce: 2s to start (short — false positives are
-  OK), 5s to end (a Meet mute / device switch shouldn't end the "call").
+  itself holds the mic while recording. Debounce: 60s to start (was 2s; raised on user request
+  2026-11-11 after the 2s version was confirmed working, to skip voice messages), 5s to end (a Meet mute / device switch shouldn't end the "call").
 - `config.json` → `callDetection { enabled, apps: [{bundleIDPrefix, name}] }`, default Chrome
   ("Google Meet") + WhatsApp. Prefix match because Chrome captures in `com.google.Chrome.helper`.
 - `CallPrompt`: corner panel (shared `CornerPanel` shell, extracted from the watchdog overlay —
@@ -27,6 +27,7 @@ message) are explicitly acceptable; a missed call is not.
 1. Spike: confirm the CoreAudio process API + real bundle IDs on this machine — **done**
    (`spike/miclisteners.swift`, see wiki.md).
 2. Detector + config + prompt + AppState wiring, build — **done**.
-3. Real walkthrough with the user — **pending**: start a Meet (green room is enough) and a
-   WhatsApp call with RecBar idle → prompt + chime within ~2s; Record starts a Meetings
+3. Real walkthrough with the user — **2s version confirmed working (WhatsApp voice
+   message, 2026-11-11)**; 60s version pending: start a Meet (green room is enough) and a
+   WhatsApp call with RecBar idle → prompt + chime after ~1 min; Record starts a Meetings
    recording; ✕ stays quiet for the rest of that call; ending the call hides the prompt.

@@ -20,10 +20,10 @@ final class CallDetector {
     private var timer: Timer?
     private var candidate: (name: String?, since: Date)?
 
-    /// How long the mic state must hold before it's reported. Short on purpose: a false
-    /// positive (e.g. a WhatsApp voice message) is fine, missing a call is not.
-    private let startDebounce: TimeInterval = 2
-    /// Longer than the start debounce so a Meet mute or a device switch doesn't end the "call".
+    /// How long a call app must hold the mic before it counts as a call: 1 minute (user
+    /// request, 2026-11-11 — was 2s), so short WhatsApp voice messages don't trigger it.
+    private let startDebounce: TimeInterval = 60
+    /// So a Meet mute or a device switch doesn't end the "call".
     private let endDebounce: TimeInterval = 5
 
     init(apps: [CallApp]) {

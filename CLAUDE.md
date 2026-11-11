@@ -447,9 +447,10 @@ this machine and OBS holds the mic while recording. While idle, `AppState.handle
 shows `CallPrompt` (corner panel via the shared `CornerPanel` shell, also used by the watchdog
 overlay; chime on show + once at 20s; red outline `record.circle` menu bar icon) whose
 **Record** starts a Meetings recording. One prompt per call: ✕ or stopping mid-call doesn't
-re-prompt until the app releases the mic (5s debounce). False positives (voice messages) are
-explicitly fine per the user — missing a call is not. **Not yet verified with a real call** —
-see `updates/2026-11-11 Call Detection - OPEN/`.
+re-prompt until the app releases the mic (5s debounce). The app must hold the mic for **60s**
+before it counts as a call (user request — was 2s, which also fired on voice messages).
+Confirmed working by the user with the 2s version (WhatsApp, 2026-11-11) — see
+`updates/2026-11-11 Call Detection - OPEN/`.
 
 ## Microphone priority rule
 
