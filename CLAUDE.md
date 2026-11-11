@@ -436,6 +436,21 @@ SF-Symbols-only icon policy — see the menu-bar-icon lesson in "Architecture" a
   with no screen/desktop-audio, mic priority resolves correctly, the file lands in
   `~/Documents/Recordings/Captain Log`) still needs a walkthrough with the user.
 
+## Call detection (added 2026-11-11)
+
+`CallDetector` polls CoreAudio's per-process objects (`kAudioHardwarePropertyProcessObjectList`,
+macOS 14+) once a second for an **allowlisted** app capturing mic input —
+`config.json` → `callDetection.apps` (default Chrome as "Google Meet" — the user uses Chrome
+only for calls — and WhatsApp; bundle-ID *prefix* match because Chrome captures in
+`com.google.Chrome.helper`). Allowlist, never "anything on the mic": a dictation app runs on
+this machine and OBS holds the mic while recording. While idle, `AppState.handleCallAppChanged`
+shows `CallPrompt` (corner panel via the shared `CornerPanel` shell, also used by the watchdog
+overlay; chime on show + once at 20s; red outline `record.circle` menu bar icon) whose
+**Record** starts a Meetings recording. One prompt per call: ✕ or stopping mid-call doesn't
+re-prompt until the app releases the mic (5s debounce). False positives (voice messages) are
+explicitly fine per the user — missing a call is not. **Not yet verified with a real call** —
+see `updates/2026-11-11 Call Detection - OPEN/`.
+
 ## Microphone priority rule
 
 Priority, highest first: **USB mic > built-in mic**. Bluetooth and wired (headphone-jack)
