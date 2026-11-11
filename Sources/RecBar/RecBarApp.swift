@@ -77,6 +77,7 @@ private struct MenuBarIcon: View {
 
     private var isColored: Bool {
         appState.watchdogPromptDeadline != nil || appState.recordingState != .idle
+            || appState.callPromptAppName != nil
     }
 
     private var iconName: String {
@@ -84,6 +85,8 @@ private struct MenuBarIcon: View {
         // that doesn't depend on the popover being open or on notification permission having
         // been granted (see AppState.tickWatchdog / WatchdogNotifier).
         if appState.watchdogPromptDeadline != nil { return "exclamationmark.triangle.fill" }
+        // A call is on but nothing is recording yet (see AppState.handleCallAppChanged).
+        if appState.callPromptAppName != nil { return "record.circle" }
         switch appState.recordingState {
         // A bold filled camera glyph rather than the thinner "video.circle" outline (2026-09-10,
         // explicit user request — the custom capsule/dot mark tried before this read as too
@@ -98,6 +101,7 @@ private struct MenuBarIcon: View {
 
     private var tint: Color {
         if appState.watchdogPromptDeadline != nil { return .orange }
+        if appState.callPromptAppName != nil { return RecBarColor.red }
         switch appState.recordingState {
         case .idle: return .primary
         case .recording: return RecBarColor.green

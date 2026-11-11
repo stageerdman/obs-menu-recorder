@@ -57,7 +57,13 @@ struct ChannelLevel: Identifiable {
 
 @MainActor
 final class AppState: ObservableObject {
-    @Published private(set) var recordingState: RecordingState = .idle
+    @Published private(set) var recordingState: RecordingState = .idle {
+        // Any recording, started from RecBar or from OBS directly, answers the call prompt.
+        didSet { if recordingState != .idle { hideCallPrompt() } }
+    }
+    /// Name of the call app RecBar is currently suggesting a recording for (drives the menu
+    /// bar icon); nil when no call prompt is showing.
+    @Published private(set) var callPromptAppName: String?
     @Published private(set) var connectionState: OBSClient.ConnectionState = .disconnected
     @Published private(set) var currentMode: RecordingMode?
     @Published private(set) var elapsed: TimeInterval = 0
@@ -83,6 +89,12 @@ final class AppState: ObservableObject {
     private let obsLauncher = OBSLauncher()
     private let watchdogNotifier = WatchdogNotifier()
     private let watchdogOverlay = WatchdogOverlayWindow()
+    private let callDetector: CallDetector
+    private let callPrompt = CallPrompt()
+    /// True once the current call has been offered a recording (prompted, dismissed, or
+    /// recorded), so stopping or dismissing mid-call doesn't re-prompt. Cleared when the call
+    /// app releases the mic.
+    private var currentCallHandled = false
 
     private var recordStartDate: Date?
     private var pausedAccumulated: TimeInterval = 0
@@ -156,6 +168,7 @@ final class AppState: ObservableObject {
         let config = ConfigStore.load()
         self.config = config
         self.obs = OBSClient(host: config.obsHost, port: config.obsPort, password: config.obsPassword)
+        self.callDetector = CallDetector(apps: config.callDetection.enabled ? config.callDetection.apps : [])
 
         obs.onConnectionStateChanged = { [weak self] state in
             self?.connectionState = state
@@ -169,6 +182,36 @@ final class AppState: ObservableObject {
         obs.connect()
 
         watchdogNotifier.onConfirm = { [weak self] in self?.confirmPresence() }
+
+        callDetector.onChange = { [weak self] appName in self?.handleCallAppChanged(appName) }
+        callDetector.start()
+    }
+
+    // MARK: - Call detection
+
+    private func handleCallAppChanged(_ appName: String?) {
+        guard let appName else {
+            currentCallHandled = false
+            hideCallPrompt()
+            return
+        }
+        currentCallHandled = recordingState != .idle // already recording: nothing to suggest
+        guard !currentCallHandled else { return }
+        currentCallHandled = true
+        callPromptAppName = appName
+        callPrompt.show(
+            appName: appName,
+            onRecord: { [weak self] in
+                self?.hideCallPrompt()
+                self?.start(mode: .sales)
+            },
+            onDismiss: { [weak self] in self?.hideCallPrompt() }
+        )
+    }
+
+    private func hideCallPrompt() {
+        callPrompt.hide()
+        callPromptAppName = nil
     }
 
     // MARK: - Startup / external-state sync

@@ -1,56 +1,23 @@
 import AppKit
 import SwiftUI
 
-/// A borderless, always-on-top panel showing the silence watchdog's "Are you there?" prompt
-/// in the top-right corner of the screen — a third, permission-free channel alongside
-/// `AlertSound` and the menu bar icon (see AppState.tickWatchdog / CLAUDE.md's "Prompt not
-/// being noticed" entry). Unlike `UNUserNotificationCenter`, this needs no OS authorization
-/// and can't silently fail to appear; unlike the inline `WatchdogBanner` in `RecordingView`,
-/// it doesn't require the popover to be open. `.fullScreenAuxiliary` + `.canJoinAllSpaces`
-/// specifically so it still shows up while the user is in a full-screen call (Zoom/Meet in
-/// full screen is exactly the situation this prompt exists for).
+/// The silence watchdog's "Are you there?" prompt in the top-right corner of the screen — a
+/// permission-free channel alongside `AlertSound` and the menu bar icon (see
+/// AppState.tickWatchdog / CLAUDE.md's "Prompt not being noticed" entry). The panel shell
+/// (always-on-top, shows over full-screen calls, never steals focus) lives in `CornerPanel`.
 @MainActor
 final class WatchdogOverlayWindow {
-    private var panel: NSPanel?
+    private let panel = CornerPanel()
 
     func show(deadline: Date, onConfirm: @escaping () -> Void) {
-        hide()
-
-        let hosting = NSHostingView(rootView: WatchdogOverlayView(deadline: deadline, onConfirm: onConfirm))
-        hosting.frame = NSRect(x: 0, y: 0, width: 340, height: 84)
-
-        let panel = NSPanel(
-            contentRect: hosting.frame,
-            styleMask: [.borderless, .nonactivatingPanel],
-            backing: .buffered,
-            defer: false
-        )
-        panel.contentView = hosting
-        panel.isOpaque = false
-        panel.backgroundColor = .clear
-        panel.hasShadow = true
-        panel.level = .statusBar
-        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
-        panel.hidesOnDeactivate = false
-        panel.isReleasedWhenClosed = false
-        panel.becomesKeyOnlyIfNeeded = true
-
-        if let screen = NSScreen.main {
-            let margin: CGFloat = 12
-            let origin = NSPoint(
-                x: screen.visibleFrame.maxX - hosting.frame.width - margin,
-                y: screen.visibleFrame.maxY - hosting.frame.height - margin
-            )
-            panel.setFrameOrigin(origin)
+        panel.show(size: NSSize(width: 340, height: 84),
+                   accessibilityLabel: "Are you there? Recording will auto-stop unless you confirm.") {
+            WatchdogOverlayView(deadline: deadline, onConfirm: onConfirm)
         }
-
-        panel.orderFrontRegardless()
-        self.panel = panel
     }
 
     func hide() {
-        panel?.orderOut(nil)
-        panel = nil
+        panel.hide()
     }
 }
 

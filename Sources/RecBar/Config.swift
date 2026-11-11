@@ -163,6 +163,28 @@ struct OneDriveConfig: Codable {
     static let `default` = OneDriveConfig(clientId: "", rootFolderName: "RecBar Recordings")
 }
 
+/// An app whose microphone use means "a call has started" (see CallDetector).
+struct CallApp: Codable {
+    /// Matched as a prefix so helper processes count (Chrome captures audio in
+    /// `com.google.Chrome.helper`).
+    var bundleIDPrefix: String
+    /// Shown in the prompt, e.g. "Call detected: Google Meet".
+    var name: String
+}
+
+/// Suggests starting a recording when a call app starts using the mic (see CallDetector /
+/// AppState.handleCallAppChanged). Always offers a Meetings recording.
+struct CallDetectionConfig: Codable {
+    var enabled: Bool
+    var apps: [CallApp]
+
+    static let `default` = CallDetectionConfig(enabled: true, apps: [
+        // Chrome is used only for Google Meet on this machine, so any Chrome mic use counts.
+        CallApp(bundleIDPrefix: "com.google.Chrome", name: "Google Meet"),
+        CallApp(bundleIDPrefix: "net.whatsapp.WhatsApp", name: "WhatsApp"),
+    ])
+}
+
 struct RecBarConfig: Codable {
     var obsHost: String
     var obsPort: Int
@@ -211,6 +233,7 @@ struct RecBarConfig: Codable {
     var micBuiltInRelease: ReleasableInputConfig
     var micWiredRelease: ReleasableInputConfig
     var oneDrive: OneDriveConfig
+    var callDetection: CallDetectionConfig
 
     static let `default` = RecBarConfig(
         obsHost: "127.0.0.1",
@@ -259,13 +282,14 @@ struct RecBarConfig: Codable {
         // — kept only because ReleasableInputConfig.makeDefault requires one.
         micBuiltInRelease: .makeDefault(inputName: "Macbook", sceneName: "Meet Recording Setup"),
         micWiredRelease: .makeDefault(inputName: "Headphones Mic", sceneName: "Meet Recording Setup"),
-        oneDrive: .default
+        oneDrive: .default,
+        callDetection: .default
     )
 
     enum CodingKeys: String, CodingKey {
         case obsHost, obsPort, obsPassword, sources, salesMode, guideMode, otherMode, captainLogMode
         case idleSceneName, cameraRelease, screenRelease, desktopAudioRelease
-        case micBuiltInRelease, micWiredRelease, oneDrive
+        case micBuiltInRelease, micWiredRelease, oneDrive, callDetection
     }
 
     init(obsHost: String, obsPort: Int, obsPassword: String, sources: SceneSourceNames,
@@ -274,7 +298,7 @@ struct RecBarConfig: Codable {
          idleSceneName: String, cameraRelease: ReleasableInputConfig,
          screenRelease: ReleasableInputConfig, desktopAudioRelease: ReleasableInputConfig,
          micBuiltInRelease: ReleasableInputConfig, micWiredRelease: ReleasableInputConfig,
-         oneDrive: OneDriveConfig) {
+         oneDrive: OneDriveConfig, callDetection: CallDetectionConfig) {
         self.obsHost = obsHost
         self.obsPort = obsPort
         self.obsPassword = obsPassword
@@ -290,6 +314,7 @@ struct RecBarConfig: Codable {
         self.micBuiltInRelease = micBuiltInRelease
         self.micWiredRelease = micWiredRelease
         self.oneDrive = oneDrive
+        self.callDetection = callDetection
     }
 
     /// Custom decoding so existing config.json files written before the per-mode watchdog
@@ -329,6 +354,7 @@ struct RecBarConfig: Codable {
         micWiredRelease = try c.decodeIfPresent(ReleasableInputConfig.self, forKey: .micWiredRelease)
             ?? .makeDefault(inputName: "Headphones Mic", sceneName: "Meet Recording Setup")
         oneDrive = try c.decodeIfPresent(OneDriveConfig.self, forKey: .oneDrive) ?? .default
+        callDetection = try c.decodeIfPresent(CallDetectionConfig.self, forKey: .callDetection) ?? .default
     }
 
     private static func decodeModeConfig(
@@ -381,6 +407,7 @@ enum ConfigStore {
         if json["micBuiltInRelease"] == nil || json["micWiredRelease"] == nil { return true }
         if json["oneDrive"] == nil { return true }
         if json["captainLogMode"] == nil { return true }
+        if json["callDetection"] == nil { return true }
         for key in ["salesMode", "guideMode", "otherMode", "captainLogMode"] {
             guard let mode = json[key] as? [String: Any] else { continue }
             guard let watchdog = mode["watchdog"] as? [String: Any] else { return true }
