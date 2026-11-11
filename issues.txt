@@ -83,6 +83,15 @@ audio hardware must be confirmed with the user (see CLAUDE.md "Testing notes").
       cloudBytesSent in library.json, so the in-progress % bar denominator is wrong for
       those. Separate from the upload failures; not touched here.
 
+- [ ] Call detection (2026-11-11, branch `call-detection`, built on unmerged
+      `live-mic-failover`): prompt when Google Meet (Chrome) / WhatsApp holds the mic while
+      RecBar is idle. 2s version confirmed working by the user (WhatsApp voice message);
+      start delay then raised to 60s on request — confirm on a real call: prompt + chime
+      after ~1 min, Record starts a Meetings recording, ✕ stays quiet for that call, ending
+      the call hides the prompt. Then merge live-mic-failover + call-detection into main.
+      Possible follow-up (not requested): suggest Stop when the call app releases the mic
+      while still recording.
+
 ## Known upstream limitations (no in-app fix)
 - OBS quit-time crash (copy_audio_data segfault) — RecBar never quits OBS as a result.
 - Camera "stuck open" after a real recording: RemoveInput can report success while the

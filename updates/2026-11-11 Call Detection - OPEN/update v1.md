@@ -31,3 +31,13 @@ message) are explicitly acceptable; a missed call is not.
    message, 2026-11-11)**; 60s version pending: start a Meet (green room is enough) and a
    WhatsApp call with RecBar idle → prompt + chime after ~1 min; Record starts a Meetings
    recording; ✕ stays quiet for the rest of that call; ending the call hides the prompt.
+
+## Where we left off (2026-11-11)
+- All code committed + pushed on `call-detection` (branched from `live-mic-failover`, which
+  isn't merged into `main` yet). Installed build in /Applications is the 60s version.
+- Next: user confirms the 60s version on a real call (phase 3), then merge both branches to
+  `main` and flip this folder to CLOSED.
+- Spike scripts kept in `spike/` for re-debugging: `miclisteners.swift` (one-shot list) and
+  `watch.swift` (live log of every process/device using the mic — build with `swiftc -O
+  watch.swift -o <scratch>/micwatch`; can't `swift watch.swift` from inside this folder).
+- Known gap: a mic release during the first minute (one 1s blip) restarts the 60s clock.
