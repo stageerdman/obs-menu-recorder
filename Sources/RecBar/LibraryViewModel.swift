@@ -14,6 +14,22 @@ final class LibraryViewModel: ObservableObject {
     @Published private(set) var items: [RecordingMetadata] = []
     @Published var signInPrompt: DeviceCodeResponse?
     @Published var signInError: String?
+    @Published private(set) var accountStatus: AccountStatus = .loading
+
+    /// What the Library's account strip shows. `unreachable` (network/transient) is kept
+    /// distinct from `signedOut` on purpose: a blip must never look like "you need to sign in
+    /// again" — the refresh token survives those (see `OneDriveAuth.validAccessToken`).
+    enum AccountStatus: Equatable {
+        case notConfigured
+        case signedOut(expired: Bool)
+        case signingIn
+        case loading
+        case connected(OneDriveClient.DriveInfo)
+        case unreachable(last: OneDriveClient.DriveInfo?)
+    }
+
+    private var lastDriveInfo: OneDriveClient.DriveInfo?
+    private var signInTask: Task<Void, Never>?
 
     private let config: RecBarConfig
     private let auth = OneDriveAuth()
@@ -29,6 +45,7 @@ final class LibraryViewModel: ObservableObject {
     func start() {
         recoverInterruptedUploads()
         reconcile()
+        refreshAccount()
         guard timer == nil else { return }
         let timer = Timer(timeInterval: 4, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.reconcile() }
@@ -253,6 +270,64 @@ final class LibraryViewModel: ObservableObject {
         }
     }
 
+    // MARK: - Account
+
+    func refreshAccount() {
+        guard !config.oneDrive.clientId.isEmpty else { accountStatus = .notConfigured; return }
+        guard auth.isSignedIn else { accountStatus = .signedOut(expired: false); return }
+        if lastDriveInfo == nil { accountStatus = .loading }
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                let info = try await self.client.driveInfo(auth: self.auth)
+                self.lastDriveInfo = info
+                self.accountStatus = .connected(info)
+            } catch OneDriveAuth.AuthError.notSignedIn {
+                // Only reached when Microsoft definitively rejected the refresh token.
+                self.accountStatus = .signedOut(expired: true)
+            } catch {
+                NSLog("RecBar: couldn't load OneDrive account: \(error)")
+                self.accountStatus = .unreachable(last: self.lastDriveInfo)
+            }
+        }
+    }
+
+    /// Explicit "Connect" from the account strip — the same device-code flow an upload
+    /// triggers implicitly when signed out.
+    func connect() {
+        guard signInTask == nil else { return }
+        signInTask = Task { [weak self] in
+            guard let self else { return }
+            defer { self.signInTask = nil }
+            do {
+                try await self.signIn()
+                self.refreshAccount()
+            } catch {
+                self.accountStatus = .signedOut(expired: false)
+                if !Task.isCancelled { self.signInError = error.localizedDescription }
+            }
+        }
+    }
+
+    func cancelSignIn() {
+        signInTask?.cancel()
+        signInTask = nil
+        signInPrompt = nil
+        accountStatus = .signedOut(expired: false)
+    }
+
+    func signOut() {
+        auth.signOut()
+        lastDriveInfo = nil
+        accountStatus = .signedOut(expired: false)
+    }
+
+    /// Microsoft's sign-in page offers "use another account", so switching is sign-out + connect.
+    func switchAccount() {
+        signOut()
+        connect()
+    }
+
     // MARK: - Cloud upload
 
     func startCloudUpload(for item: RecordingMetadata) {
@@ -299,6 +374,7 @@ final class LibraryViewModel: ObservableObject {
         do {
             if !auth.isSignedIn {
                 try await signIn()
+                refreshAccount()
             }
             guard var item = items.first(where: { $0.id == itemId }) else { return }
 
@@ -328,13 +404,35 @@ final class LibraryViewModel: ObservableObject {
             item.cloudErrorMessage = nil
             updateItem(item)
 
-            try await client.uploadFile(itemId: uploadItemId, localPath: localPath, auth: auth) { [weak self] sent, _ in
+            let onProgress: (Int64, Int64) -> Void = { [weak self] sent, _ in
                 Task { @MainActor in self?.updateProgress(itemId, sent: sent) }
+            }
+            do {
+                try await client.uploadFile(itemId: uploadItemId, localPath: localPath, auth: auth,
+                                            onProgress: onProgress)
+            } catch OneDriveClient.GraphError.requestFailed(let code, _) where [403, 404].contains(code) {
+                // The reused item is gone or belongs to a different Microsoft account (this
+                // library holds items from two drives — a sign-in switch left old failed entries
+                // pointing at an item the current account can't see). Make a fresh one; the
+                // share link changes, but the alternative is a row that can never succeed.
+                let folderId = try await client.ensureFolder(
+                    rootName: config.oneDrive.rootFolderName,
+                    categoryName: item.category.title, auth: auth
+                )
+                let created = try await client.createPlaceholderAndLink(
+                    fileName: fileName, folderId: folderId, auth: auth
+                )
+                item.cloudItemId = created.itemId
+                item.cloudWebUrl = created.webUrl
+                updateItem(item)
+                try await client.uploadFile(itemId: created.itemId, localPath: localPath, auth: auth,
+                                            onProgress: onProgress)
             }
 
             guard var finished = items.first(where: { $0.id == itemId }) else { return }
             finished.cloudUploadState = .uploaded
             updateItem(finished)
+            refreshAccount()  // storage just changed
         } catch {
             // A user-initiated cancel (see `cancelUpload`) cancels this task, which surfaces
             // here as a thrown error — but cancelUpload already reset the entry to `.none`, so
@@ -342,10 +440,12 @@ final class LibraryViewModel: ObservableObject {
             if Task.isCancelled { return }
             NSLog("RecBar: OneDrive upload failed: \(error)")
             setState(itemId, .failed, error: error.localizedDescription)
+            refreshAccount()  // an expired sign-in or a full drive should show up top, not only in a tooltip
         }
     }
 
     private func signIn() async throws {
+        accountStatus = .signingIn
         let device = try await auth.requestDeviceCode()
         signInPrompt = device
         defer { signInPrompt = nil }

@@ -22,6 +22,8 @@ struct LibraryView: View {
         VStack(spacing: 0) {
             header
             Divider()
+            OneDriveAccountStrip(viewModel: viewModel)
+            Divider()
             if viewModel.items.isEmpty {
                 emptyState
             } else {
@@ -47,7 +49,7 @@ struct LibraryView: View {
         .onAppear { viewModel.start() }
         .onDisappear { viewModel.stop() }
         .sheet(item: $viewModel.signInPrompt) { device in
-            OneDriveSignInView(device: device)
+            OneDriveSignInView(device: device) { viewModel.cancelSignIn() }
         }
         .alert("OneDrive", isPresented: Binding(
             get: { viewModel.signInError != nil },
@@ -294,6 +296,7 @@ private struct RecordingRow: View {
 
 private struct OneDriveSignInView: View {
     let device: DeviceCodeResponse
+    let onCancel: () -> Void
 
     var body: some View {
         VStack(spacing: 16) {
@@ -313,6 +316,8 @@ private struct OneDriveSignInView: View {
             .buttonStyle(.borderedProminent)
             ProgressView("Waiting for confirmation…")
                 .controlSize(.small)
+            Button("Cancel", action: onCancel)
+                .keyboardShortcut(.cancelAction)
         }
         .padding(24)
         .frame(width: 320)

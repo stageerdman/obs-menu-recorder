@@ -92,6 +92,13 @@ audio hardware must be confirmed with the user (see CLAUDE.md "Testing notes").
       Possible follow-up (not requested): suggest Stop when the call app releases the mic
       while still recording.
 
+- [ ] OneDrive account strip + upload recovery (2026-11-13, branch `onedrive-account`, on top of
+      `call-detection`): Library window now shows the signed-in account, free space, and
+      Connect / Switch Account / Sign Out. Chunk failures keep OneDrive's real error text; dead
+      upload sessions (401/403/404) restart; items from the other Microsoft account get a fresh
+      placeholder. Confirm: strip shows your name + space; retry "2026-11-13 Sales Call - Lukas
+      Vrabel" (failed with 401 at byte 0) — if it fails again, hover the red icon for the reason.
+
 ## Known upstream limitations (no in-app fix)
 - OBS quit-time crash (copy_audio_data segfault) — RecBar never quits OBS as a result.
 - Camera "stuck open" after a real recording: RemoveInput can report success while the

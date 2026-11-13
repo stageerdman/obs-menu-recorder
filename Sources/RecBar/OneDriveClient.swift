@@ -15,10 +15,59 @@ final class OneDriveClient {
 
         var errorDescription: String? {
             switch self {
-            case .requestFailed(let code, let body): return "OneDrive request failed (\(code)): \(body)"
+            case .requestFailed(let code, let body):
+                if code == 507 || body.contains("quotaLimitReached") || body.contains("insufficientStorage") {
+                    return "OneDrive is full — free up space or upgrade storage."
+                }
+                return "OneDrive request failed (\(code)): \(Self.graphMessage(from: body))"
             case .malformedResponse: return "OneDrive sent a malformed response."
             }
         }
+
+        /// Graph error bodies look like `{"error":{"code":"…","message":"…"}}` — surface just the
+        /// human-readable part instead of a raw JSON blob in the row's tooltip.
+        static func graphMessage(from body: String) -> String {
+            guard let data = body.data(using: .utf8),
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let error = json["error"] as? [String: Any] else { return body }
+            let code = error["code"] as? String
+            let message = error["message"] as? String
+            return [code, message].compactMap { $0 }.joined(separator: ": ")
+        }
+    }
+
+    /// The signed-in account's display name + storage, from `GET /me/drive` — available under
+    /// the existing `Files.ReadWrite` scope, so no extra consent (an email address would need
+    /// `User.Read`, i.e. forcing every user through a fresh sign-in just to show it).
+    struct DriveInfo: Equatable {
+        let driveId: String
+        let ownerName: String?
+        let usedBytes: Int64
+        let totalBytes: Int64
+        /// Graph's own verdict: "normal" / "nearing" / "critical" / "exceeded".
+        let quotaState: String
+    }
+
+    func driveInfo(auth: OneDriveAuth) async throws -> DriveInfo {
+        let token = try await auth.validAccessToken()
+        var request = URLRequest(url: URL(string: "\(Self.base)/me/drive?$select=id,owner,quota")!)
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        let (data, response) = try await session.data(for: request)
+        let status = (response as? HTTPURLResponse)?.statusCode ?? -1
+        guard status == 200,
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let driveId = json["id"] as? String else {
+            throw GraphError.requestFailed(status, String(data: data, encoding: .utf8) ?? "")
+        }
+        let owner = (json["owner"] as? [String: Any])?["user"] as? [String: Any]
+        let quota = json["quota"] as? [String: Any] ?? [:]
+        return DriveInfo(
+            driveId: driveId,
+            ownerName: owner?["displayName"] as? String,
+            usedBytes: (quota["used"] as? NSNumber)?.int64Value ?? 0,
+            totalBytes: (quota["total"] as? NSNumber)?.int64Value ?? 0,
+            quotaState: quota["state"] as? String ?? "normal"
+        )
     }
 
     private static let base = "https://graph.microsoft.com/v1.0"
@@ -130,6 +179,73 @@ final class OneDriveClient {
     /// mid-upload just restarts this call from byte 0 against the same existing item id.
     func uploadFile(itemId: String, localPath: String, auth: OneDriveAuth,
                      onProgress: @escaping (Int64, Int64) -> Void) async throws {
+        var uploadUrl = try await createUploadSession(itemId: itemId, auth: auth)
+
+        let fileHandle = try FileHandle(forReadingFrom: URL(fileURLWithPath: localPath))
+        defer { try? fileHandle.close() }
+        let attrs = try? FileManager.default.attributesOfItem(atPath: localPath)
+        let totalSize = (attrs?[.size] as? NSNumber)?.int64Value ?? 0
+
+        var offset: Int64 = 0
+        var consecutiveFailures = 0
+        var sessionRestarts = 0
+        while offset < totalSize {
+            try Task.checkCancellation()
+            let end = min(offset + Self.chunkSize, totalSize) - 1
+            try fileHandle.seek(toOffset: UInt64(offset))
+            let chunk = try fileHandle.read(upToCount: Int(end - offset + 1)) ?? Data()
+
+            do {
+                // No Authorization header on chunk PUTs — the upload URL itself is pre-authenticated.
+                var chunkRequest = URLRequest(url: uploadUrl)
+                chunkRequest.httpMethod = "PUT"
+                chunkRequest.setValue("bytes \(offset)-\(end)/\(totalSize)", forHTTPHeaderField: "Content-Range")
+                let (body, chunkResponse) = try await session.upload(for: chunkRequest, from: chunk)
+                let status = (chunkResponse as? HTTPURLResponse)?.statusCode ?? -1
+                guard (200...202).contains(status) else {
+                    // Keep OneDrive's own explanation — the old "chunk upload failed at byte 0"
+                    // message hid *why* (a real 401 on 2026-11-13 couldn't be diagnosed from it).
+                    throw GraphError.requestFailed(status, String(data: body, encoding: .utf8) ?? "")
+                }
+                consecutiveFailures = 0
+                offset = end + 1
+                onProgress(offset, totalSize)
+            } catch {
+                // A cancel (user aborted the upload) must propagate, not be retried.
+                if Task.isCancelled { throw error }
+                if case GraphError.requestFailed(let code, _) = error, (400...499).contains(code), code != 429 {
+                    // 401/403/404 from the *pre-authenticated upload URL* means the session
+                    // itself is dead (expired, or rejected) — not our token, which isn't sent
+                    // here. A fresh session against the same item is the remedy, and keeps the
+                    // share link. Bounded so a genuinely broken item can't loop forever.
+                    // Any other 4xx (e.g. 507-style quota or a malformed range) fails fast.
+                    guard [401, 403, 404].contains(code), sessionRestarts < 2 else { throw error }
+                    sessionRestarts += 1
+                    uploadUrl = try await createUploadSession(itemId: itemId, auth: auth)
+                    offset = 0
+                    onProgress(0, totalSize)
+                    continue
+                }
+                consecutiveFailures += 1
+                if consecutiveFailures > Self.maxChunkRetries { throw error }
+                // Exponential backoff (capped at 30s), then resume from the byte OneDrive
+                // actually still expects — a chunk may have been partially received before the
+                // drop, so trusting the server's own offset beats blindly re-sending our last one.
+                let delaySeconds = min(pow(2.0, Double(consecutiveFailures)), 30)
+                try await Task.sleep(nanoseconds: UInt64(delaySeconds * 1_000_000_000))
+                if let serverNext = await nextExpectedOffset(uploadUrl: uploadUrl) {
+                    offset = serverNext
+                    onProgress(offset, totalSize)
+                }
+            }
+        }
+    }
+
+    /// Starts a resumable upload session scoped to the existing `itemId`. Throws
+    /// `GraphError.requestFailed` with Graph's status — a 404 here means the item doesn't exist
+    /// in the *current* account's drive (e.g. it was created while signed in to a different
+    /// Microsoft account), which `LibraryViewModel.runUpload` handles by making a new one.
+    private func createUploadSession(itemId: String, auth: OneDriveAuth) async throws -> URL {
         let token = try await auth.validAccessToken()
         var sessionRequest = URLRequest(url: URL(string: "\(Self.base)/me/drive/items/\(itemId)/createUploadSession")!)
         sessionRequest.httpMethod = "POST"
@@ -146,57 +262,7 @@ final class OneDriveClient {
             throw GraphError.requestFailed((sessionResponse as? HTTPURLResponse)?.statusCode ?? -1,
                                             String(data: sessionData, encoding: .utf8) ?? "")
         }
-
-        let fileHandle = try FileHandle(forReadingFrom: URL(fileURLWithPath: localPath))
-        defer { try? fileHandle.close() }
-        let attrs = try? FileManager.default.attributesOfItem(atPath: localPath)
-        let totalSize = (attrs?[.size] as? NSNumber)?.int64Value ?? 0
-
-        var offset: Int64 = 0
-        var consecutiveFailures = 0
-        while offset < totalSize {
-            try Task.checkCancellation()
-            let end = min(offset + Self.chunkSize, totalSize) - 1
-            try fileHandle.seek(toOffset: UInt64(offset))
-            let chunk = try fileHandle.read(upToCount: Int(end - offset + 1)) ?? Data()
-
-            do {
-                // No Authorization header on chunk PUTs — the upload URL itself is pre-authenticated.
-                var chunkRequest = URLRequest(url: uploadUrl)
-                chunkRequest.httpMethod = "PUT"
-                chunkRequest.setValue("bytes \(offset)-\(end)/\(totalSize)", forHTTPHeaderField: "Content-Range")
-                let (_, chunkResponse) = try await session.upload(for: chunkRequest, from: chunk)
-                let status = (chunkResponse as? HTTPURLResponse)?.statusCode ?? -1
-                guard (200...202).contains(status) else {
-                    throw GraphError.requestFailed(status, "chunk upload failed at byte \(offset)")
-                }
-                consecutiveFailures = 0
-                offset = end + 1
-                onProgress(offset, totalSize)
-            } catch {
-                // A cancel (user aborted the upload) must propagate, not be retried.
-                if Task.isCancelled { throw error }
-                // A 4xx other than 429 (throttling) is a genuine client error — bad token,
-                // deleted item, malformed request — that re-sending can't fix, so fail fast
-                // rather than burning the whole retry budget on it. Everything else (network
-                // drops/timeouts, 5xx, 429) is a transient worth retrying.
-                if case GraphError.requestFailed(let code, _) = error,
-                   (400...499).contains(code), code != 429 {
-                    throw error
-                }
-                consecutiveFailures += 1
-                if consecutiveFailures > Self.maxChunkRetries { throw error }
-                // Exponential backoff (capped at 30s), then resume from the byte OneDrive
-                // actually still expects — a chunk may have been partially received before the
-                // drop, so trusting the server's own offset beats blindly re-sending our last one.
-                let delaySeconds = min(pow(2.0, Double(consecutiveFailures)), 30)
-                try await Task.sleep(nanoseconds: UInt64(delaySeconds * 1_000_000_000))
-                if let serverNext = await nextExpectedOffset(uploadUrl: uploadUrl) {
-                    offset = serverNext
-                    onProgress(offset, totalSize)
-                }
-            }
-        }
+        return uploadUrl
     }
 
     /// Queries a resumable upload session for the next byte OneDrive still expects, so a retry
