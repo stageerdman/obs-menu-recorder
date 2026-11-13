@@ -962,6 +962,14 @@ per-file OneDrive share link.
     delete resets it to) already serves as "restore to cloud." `OneDriveClient.delete` treats
     a `404` as success (already-gone is the desired end state either way). None of this is
     yet verified against a real OneDrive account — same caveat as the rest of this section.
+  - **Account strip (2026-11-13)**: `Views/OneDriveAccountStrip.swift` sits under the Library
+    header and shows the signed-in name + free space (`OneDriveClient.driveInfo`, `GET /me/drive`
+    — no extra scope), plus Connect / Switch Account / Sign Out, driven by
+    `LibraryViewModel.accountStatus`. "Can't reach" (transient) is kept separate from "sign-in
+    expired". Upload recovery: a 401/403/404 from the pre-authenticated upload URL starts a fresh
+    session (max 2); a reused item id that 403/404s (this library spans two Microsoft accounts)
+    gets a new placeholder + link. Not yet confirmed by the user — see
+    `updates/2026-11-13 OneDrive Account - OPEN/`.
   - `RecBarConfig.oneDrive: OneDriveConfig` (`clientId` empty by default, `rootFolderName`
     defaulting to `"RecBar Recordings"`) follows the same migration-safe
     `decodeIfPresent(...) ?? default` pattern as every other field added to this struct — an
